@@ -39,6 +39,7 @@ maxLogEntries := 50
 currentActivity := "Idle - Monitoring inactivity"
 realtimeMonitorGui := 0
 realtimeMonitorActive := false
+trayToggleMenuCurrentLabel := ""  ; Tracks current tray toggle menu text
 
 ; Service-based pause tracking
 pauseServices := []  ; Array of service names to pause when running
@@ -1095,18 +1096,7 @@ SimulateHuman() {
 ; HOTKEYS
 ; ============================================
 ^!p:: {  ; Ctrl+Alt+P: Toggle Pause
-    global simulationActive, pausedByUser
-    pausedByUser := !pausedByUser
-
-    if (pausedByUser) {
-        simulationActive := false
-        SetTimer(SimulateHuman, 0)
-        LogActivity("User", "Paused simulation")
-        UpdateTrayIcon()  ; Update to desktop icon when paused
-    } else {
-        LogActivity("User", "Resumed simulation")
-        UpdateTrayIcon()  ; Update to red X icon when active
-    }
+    TogglePauseState("Hotkey")
 }
 
 ^!r:: {  ; Ctrl+Alt+R: Force Resume
@@ -1143,6 +1133,24 @@ SimulateHuman() {
 
 ^!m:: {  ; Ctrl+Alt+M: Real-time Activity Monitor
     ToggleRealtimeMonitor()
+}
+
+TogglePauseState(trigger := "User") {
+    global simulationActive, pausedByUser, currentActivity
+
+    pausedByUser := !pausedByUser
+
+    if (pausedByUser) {
+        simulationActive := false
+        SetTimer(SimulateHuman, 0)
+        currentActivity := "⏸️ PAUSED - Manual toggle active"
+        LogActivity(trigger, "Paused simulation")
+    } else {
+        currentActivity := "⏳ Idle - Monitoring for inactivity (10s threshold)"
+        LogActivity(trigger, "Resumed simulation")
+    }
+
+    UpdateTrayIcon()
 }
 
 ; ============================================
@@ -1831,6 +1839,8 @@ ShowScriptStatus() {
 ; SYSTRAY MENU - Exit and Sleep Setting options
 ; ============================================
 A_TrayMenu.Delete()  ; Clear default menu
+A_TrayMenu.Add(trayToggleMenuCurrentLabel := "Toggle Simulation", (*) => TogglePauseState("Tray Menu"))
+A_TrayMenu.Add()  ; Separator
 A_TrayMenu.Add("General Settings (Ctrl+Alt+Shift+S)", (*) => Send("^!+s"))
 A_TrayMenu.Add("Auto-Quit setting (Ctrl+Alt+Shift+T)", (*) => Send("^!+t"))
 A_TrayMenu.Add("Service Pause Settings", (*) => ShowServiceSettings())
@@ -1842,20 +1852,53 @@ UpdateTrayIcon() {
     global simulationActive, pausedByUser
 
     try {
-        if (simulationActive && !pausedByUser) {
+        if (pausedByUser) {
+            ; Paused state - Pause icon (shell32.dll icon 240 resembles "||")
+            TraySetIcon("shell32.dll", 240)
+        } else if (simulationActive) {
             ; Active state - Red X icon (shell32.dll icon 27 = error/red X)
             TraySetIcon("shell32.dll", 27)
         } else {
-            ; Idle/Paused state - Desktop/PC icon (shell32.dll icon 34 = desktop/computer)
+            ; Idle/monitoring state - Desktop/PC icon (shell32.dll icon 34 = desktop/computer)
             TraySetIcon("shell32.dll", 34)
         }
     } catch {
         ; If icon setting fails, continue silently
     }
+
+    UpdateTrayToggleMenu()
 }
 
 ; Set initial desktop icon (default state)
 UpdateTrayIcon()
+
+UpdateTrayToggleMenu() {
+    global trayToggleMenuCurrentLabel, pausedByUser
+
+    if (trayToggleMenuCurrentLabel == "") {
+        return
+    }
+
+    newLabel := pausedByUser ? "Play ▶ Resume" : "Pause | |"
+    currentLabel := trayToggleMenuCurrentLabel
+
+    if (currentLabel != newLabel) {
+        try {
+            A_TrayMenu.Rename(currentLabel, newLabel)
+            trayToggleMenuCurrentLabel := newLabel
+        } catch {
+            return
+        }
+    }
+
+    currentLabel := trayToggleMenuCurrentLabel
+    try {
+        iconIndex := pausedByUser ? 239 : 240  ; shell32.dll icons for play/pause
+        A_TrayMenu.SetIcon(currentLabel, "shell32.dll", iconIndex)
+    } catch {
+        ; Ignore icon errors
+    }
+}
 
 ; ============================================
 ; INITIALIZATION

@@ -18,14 +18,16 @@
 
 ### Method 3: Tray Icon Status
 **Look for the tray icon** in the system tray (bottom-right corner)
-- **Desktop/PC icon** = Script is idle/paused (monitoring for inactivity)
+- **Desktop/PC icon** = Script is monitoring for inactivity
+- **Pause icon (`||`)** = Script is manually paused
 - **Red X icon** = Script is active (performing simulation)
 - Icon changes immediately when you interact with computer
-- Right-click the icon for menu options
+- Right-click the icon for menu options (Pause/Play toggle + settings)
 
 **Icon States:**
-- 🖥️ Desktop icon = Monitoring/Waiting/Paused
-- ❌ Red X icon = Active/Simulating
+- 🖥️ Desktop icon = Monitoring / Waiting for idle time
+- ⏸️ Pause icon (`||`) = Manually paused via `Ctrl+Alt+P` or tray toggle
+- ❌ Red X icon = Active / Simulating
 
 ### Method 4: Task Manager
 1. Press `Ctrl+Shift+Esc` to open Task Manager
@@ -43,7 +45,7 @@ Status: ACTIVE / MONITORING / PAUSED
 Uptime: Xh Ym Zs
 Simulation: Running / Waiting for inactivity
 Paused: Yes / No
-Inactivity Threshold: 50 seconds
+Inactivity Threshold: 50 seconds (default)
 Last Input: X seconds ago
 Scheduled Quit: Not set / HH:MM remaining
 
@@ -68,7 +70,7 @@ HH:MM:SS - Activity Type - Details
 |--------|--------|-------------|
 | `Ctrl+Alt+S` | **Show Status** | Display detailed status and activity log (check if running) |
 | `Ctrl+Alt+M` | **Real-time Monitor** | Open/close real-time activity monitor window |
-| `Ctrl+Alt+P` | Toggle Pause | Pause/resume simulation manually |
+| `Ctrl+Alt+P` | Toggle Pause | Pause/resume simulation manually (matches tray Pause/Play option) |
 | `Ctrl+Alt+R` | Force Resume | Force start simulation immediately |
 | `Ctrl+Alt+Q` | Quit Script | Exit the application |
 | `Ctrl+Shift+H` | Toggle Tray Icon | Show/hide system tray icon |
@@ -77,6 +79,7 @@ HH:MM:SS - Activity Type - Details
 
 ## Tray Menu (Right-click tray icon)
 
+- **Pause | | / Play ▶ Toggle (Ctrl+Alt+P)** - Single entry that flips between pause and resume states
 - **General Settings (Ctrl+Alt+Shift+S)** - Configure thresholds and timings
 - **Auto-Quit setting (Ctrl+Alt+Shift+T)** - Schedule automatic quit
 - **Service Pause Settings** - Configure service-based pause
@@ -90,13 +93,15 @@ The tray icon provides visual feedback about script status:
 
 | Icon | State | Meaning |
 |------|-------|---------|
-| 🖥️ Desktop/PC Icon | Idle/Paused | Script is monitoring for inactivity or manually paused |
+| 🖥️ Desktop/PC Icon | Monitoring | Script is waiting for inactivity |
+| ⏸️ Pause Icon (`||`) | Manual Pause | Script is paused via user toggle |
 | ❌ Red X Icon | Active | Script is performing simulation (mouse moves, key presses, etc.) |
 
 **Icon Behavior:**
 - Changes to red X immediately when simulation starts
 - Changes back to desktop icon immediately when you move mouse or type
-- Changes to desktop icon when manually paused (`Ctrl+Alt+P`)
+- Changes to pause icon (`||`) when manually paused (`Ctrl+Alt+P` or tray toggle)
+- Returns to desktop icon when monitoring again
 - Always visible by default (not hidden)
 
 ## Troubleshooting
@@ -121,7 +126,7 @@ The tray icon provides visual feedback about script status:
 
 **Tray icon not changing?**
 - Icon should change to red X when simulation is active
-- Icon should change to desktop icon when paused or when you interact
+- Icon should change to pause icon (`||`) when manually paused, and back to desktop when monitoring
 - If icon doesn't change, check status with `Ctrl+Alt+S`
 - Verify script isn't stuck in a paused state
 
@@ -133,12 +138,12 @@ The tray icon provides visual feedback about script status:
 ## Quick Reference
 
 **Fastest way to check status:**
-1. Look at tray icon (desktop = idle, red X = active)
+1. Look at tray icon (desktop = monitoring, `||` = manual pause, red X = active)
 2. Press `Ctrl+Alt+S` for detailed status
 3. Press `Ctrl+Alt+M` for real-time activity monitor
 
 **To verify script is working:**
-1. Leave system idle for 50+ seconds
+1. Leave system idle for 50+ seconds (or your configured threshold)
 2. Tray icon should change to red X
 3. Mouse should start moving automatically
 4. Press `Ctrl+Alt+S` to see activity log

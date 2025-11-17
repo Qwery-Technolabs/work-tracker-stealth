@@ -16,7 +16,7 @@ This script is provided for **educational and automation purposes only**. Use re
 ## Features
 
 ### Core Functionality
-- **Inactivity Detection**: Monitors user input using Windows API (`GetLastInputInfo`) and triggers simulation after 50 seconds of inactivity (configurable)
+- **Inactivity Detection**: Monitors user input using Windows API (`GetLastInputInfo`) and triggers simulation after ~50 seconds of inactivity (configurable)
 - **Human-Like Mouse Movements**: Smooth movements across entire screen with multiple patterns (small, medium, waypoint paths, oval shapes)
 - **Random Key Presses**: Safe modifier keys (Ctrl, Alt, Shift) and function keys (F1-F12) to avoid interfering with documents
 - **Scroll Wheel Actions**: Automatic scroll actions after mouse movements (10 seconds delay) plus random scroll events
@@ -30,7 +30,7 @@ This script is provided for **educational and automation purposes only**. Use re
 
 ### Stealth Features
 - **Process Hiding**: Instructions for renaming compiled EXE to mimic Windows system processes (e.g., `WindowsUpdateHelper.exe`, `SvcScreenHost.exe`)
-- **Tray Icon Management**: Desktop icon when idle/paused, red X icon when active, immediate updates on user activity
+- **Tray Icon Management**: Desktop icon while monitoring, red X icon when actively simulating, dedicated pause icon (`||`) plus matching tray-menu toggle that switches between pause/play labels
 - **Minimal Footprint**: Low CPU usage (<1%), no file logging, in-memory operations only
 - **Multi-Monitor Support**: Automatically detects and works with multiple monitors
 - **Activity Logging**: Last 50 activities stored in memory for monitoring
@@ -83,18 +83,18 @@ This script is provided for **educational and automation purposes only**. Use re
    - Monitor for user inactivity (default: 50 seconds)
    - Automatically begin simulation when idle
    - Pause immediately when you move the mouse or type
-   - Tray icon changes to red X when active, back to desktop icon when paused
+   - Tray icon changes to red X when active, `||` when manually paused, and back to desktop icon when monitoring
 
 3. **Access controls**:
    - Press `Ctrl+Alt+S` to view status and activity log
    - Press `Ctrl+Alt+M` to open real-time activity monitor
-   - Right-click the tray icon for menu options
+   - Right-click the tray icon for menu options, including a single Pause/Play toggle that mirrors `Ctrl+Alt+P`
 
 ### Hotkeys
 
 | Hotkey | Action | Description |
 |--------|--------|-------------|
-| `Ctrl+Alt+P` | Toggle Pause | Pause/resume simulation manually |
+| `Ctrl+Alt+P` | Toggle Pause | Pause/resume simulation manually (mirrors tray Pause/Play toggle) |
 | `Ctrl+Alt+R` | Force Resume | Force start simulation immediately |
 | `Ctrl+Alt+Q` | Quit Script | Exit the application |
 | `Ctrl+Alt+S` | Show Status | Display detailed status and activity log |

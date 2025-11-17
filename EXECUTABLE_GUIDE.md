@@ -166,8 +166,9 @@ After compilation, you should see:
 - No file logging (in-memory only)
 
 ✅ **Tray Icon Management**
-- Desktop icon when idle/paused
+- Desktop icon when monitoring
 - Red X icon when active
+- Pause icon (`||`) plus matching tray-menu toggle for manual pause/play
 - Immediate icon updates on user activity
 
 ✅ **Activity Logging**
@@ -202,6 +203,7 @@ After compilation, you should see:
    - Starts activity simulation when idle
    - Pauses immediately when you move mouse or type
    - Resumes after next inactivity period
+   - Updates tray icon to desktop (monitoring), red X (active), or `||` (manual pause) to reflect state
 
 2. **You Can:**
    - Use your computer normally - script pauses automatically
@@ -228,7 +230,7 @@ After compilation, you should see:
 #### General Settings
 
 **Inactivity Threshold:**
-- Default: 10 seconds (configurable 1-60 seconds)
+- Default: 50 seconds (configurable 1-60 seconds)
 - How long to wait before starting simulation
 - Lower = more sensitive, Higher = less sensitive
 
@@ -277,7 +279,7 @@ After compilation, you should see:
 
 | Hotkey | Action | Description |
 |--------|--------|-------------|
-| `Ctrl+Alt+P` | Toggle Pause | Pause/resume simulation manually |
+| `Ctrl+Alt+P` | Toggle Pause | Pause/resume simulation manually (same as tray Pause/Play toggle) |
 | `Ctrl+Alt+R` | Force Resume | Force start simulation immediately |
 | `Ctrl+Alt+Q` | Quit Script | Exit the application |
 | `Ctrl+Alt+S` | Show Status | Display detailed status and activity log |
@@ -293,6 +295,7 @@ After compilation, you should see:
 
 ### Tray Menu Options
 
+- **Pause | | / Play ▶ Toggle (Ctrl+Alt+P)** - Single menu entry that switches label/icon based on state
 - **General Settings (Ctrl+Alt+Shift+S)** - Configure thresholds and timings
 - **Auto-Quit setting (Ctrl+Alt+Shift+T)** - Schedule automatic quit
 - **Service Pause Settings** - Configure service-based pause
@@ -672,6 +675,7 @@ Ctrl+Alt+M  →  Real-time Monitor
 
 ```
 Right-click Tray Icon:
+  ├─ Pause | | / Play ▶ Toggle
   ├─ General Settings
   ├─ Auto-Quit Setting
   ├─ Service Pause Settings

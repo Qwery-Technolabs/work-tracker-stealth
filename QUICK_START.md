@@ -24,10 +24,10 @@
    - The script starts in monitoring mode (desktop icon in system tray)
 
 3. **How It Works**
-   - Script monitors for 50 seconds of inactivity (configurable)
+   - Script monitors for ~50 seconds of inactivity (configurable)
    - Automatically starts human-like simulation (mouse moves, scroll actions, key presses, window switching)
    - Pauses immediately when you move mouse or type
-   - Tray icon changes to red X when active, back to desktop icon when paused
+   - Tray icon changes to red X when active, `||` when manually paused, and back to desktop icon when monitoring
    - Resumes after next inactivity period
 
 ## Quick Controls
@@ -36,7 +36,7 @@
 |--------|--------|-------------|
 | Show Status | `Ctrl+Alt+S` | View detailed status and activity log |
 | Real-time Monitor | `Ctrl+Alt+M` | Open/close real-time activity monitor |
-| Pause/Resume | `Ctrl+Alt+P` | Toggle simulation manually |
+| Pause/Resume | `Ctrl+Alt+P` | Toggle simulation manually (same as tray Pause/Play option) |
 | Force Resume | `Ctrl+Alt+R` | Force start simulation immediately |
 | Quit Script | `Ctrl+Alt+Q` | Exit the application |
 | General Settings | `Ctrl+Alt+Shift+S` | Configure thresholds and timings |
@@ -62,8 +62,8 @@
 - [ ] Script runs without errors
 - [ ] Tray icon appears (desktop icon when idle)
 - [ ] Press `Ctrl+Alt+S` to verify status display works
-- [ ] Leave system idle for 50+ seconds
-- [ ] Verify tray icon changes to red X when active
+- [ ] Leave system idle for 50+ seconds (or your configured threshold)
+- [ ] Verify tray icon changes to red X when active and to `||` when you pause manually
 - [ ] Verify mouse moves automatically across screen
 - [ ] Verify scroll actions occur after mouse movements
 - [ ] Move mouse to verify pause works (icon changes back to desktop)
