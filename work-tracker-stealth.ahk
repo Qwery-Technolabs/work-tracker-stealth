@@ -45,6 +45,22 @@ trayToggleMenuCurrentLabel := ""  ; Tracks current tray toggle menu text
 pauseServices := []  ; Array of service names to pause when running
 serviceCheckEnabled := false  ; Whether to check services
 
+; Mouse click target position (0 = not set, otherwise {x: X, y: Y})
+mouseClickTargetPos := 0  ; Target position for multiple left-clicks
+
+; Event enable/disable states (all enabled by default)
+eventEnabled := Map(
+    "MouseMovement", true,
+    "ScrollWheel", true,
+    "KeyPresses", true,
+    "MouseClicks", true,
+    "WindowSwitch", true,
+    "HardwareAdjust", true
+)
+
+; Settings INI file path
+settingsIniPath := A_ScriptDir . "\work-tracker-settings.ini"
+
 ; Function to add activity to log
 LogActivity(activityType, details := "") {
     global activityLog, maxLogEntries
@@ -283,7 +299,8 @@ CheckUserInput() {
     currentInputTime := GetLastInputInfo()
     if (timeSinceActionEnd < actionBufferTime && scriptActionEndTime > 0) {
         ; Still in buffer period - but check if input is different from script's input
-        if (currentInputTime > 0 && currentInputTime != lastScriptInputTime && currentInputTime != lastKnownInputTime) {
+        if (currentInputTime > 0 && currentInputTime != lastScriptInputTime && currentInputTime !=
+            lastKnownInputTime) {
             ; Input is different from script's input - likely user input
             ; Update icon IMMEDIATELY even during buffer period
             if (simulationActive) {
@@ -890,6 +907,151 @@ PerformScrollWheel() {
 }
 
 ; ============================================
+; MOUSE CLICKS (MULTIPLE LEFT-CLICKS)
+; ============================================
+; Check if mouse position is in content area (not taskbar or menu bar)
+IsInContentArea(mouseX, mouseY) {
+    ; Get screen dimensions
+    screenWidth := A_ScreenWidth
+    screenHeight := A_ScreenHeight
+
+    ; Safe margins to avoid taskbar and menu bar
+    ; Taskbar is typically at bottom with ~40-50px height (can be larger)
+    ; Menu bar is typically at top with ~30-40px height
+    ; Use larger margins to be safe: 50px from top, 60px from bottom
+    topMargin := 50
+    bottomMargin := 60
+
+    ; Check if mouse is within content area bounds
+    ; Must be below top margin and above bottom margin
+    if (mouseY < topMargin || mouseY > (screenHeight - bottomMargin)) {
+        return false
+    }
+
+    ; Also check horizontal bounds (avoid edge areas that might be taskbar on sides)
+    ; Taskbar can be on left/right, so add small margins
+    leftMargin := 5
+    rightMargin := 5
+    if (mouseX < leftMargin || mouseX > (screenWidth - rightMargin)) {
+        return false
+    }
+
+    ; Mouse is in content area
+    return true
+}
+
+; Perform multiple left-clicks (e.g., 10 clicks within 1-3 seconds)
+; Only clicks if mouse is in content area (not taskbar or menu bar)
+; Uses pre-selected target position if set, otherwise uses current mouse position
+PerformMouseClicks() {
+    global simulationActive, pausedByUser, currentActivity, mouseClickTargetPos
+
+    ; Don't click if simulation is paused or not active
+    if (!simulationActive || pausedByUser) {
+        return
+    }
+
+    ; Determine target position
+    targetX := 0
+    targetY := 0
+    useTargetPos := false
+
+    ; Check if user has set a target position
+    if (mouseClickTargetPos != 0 && mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y")) {
+        ; Use pre-selected target position
+        targetX := mouseClickTargetPos.x
+        targetY := mouseClickTargetPos.y
+        useTargetPos := true
+
+        ; Validate target position is in content area
+        if (!IsInContentArea(targetX, targetY)) {
+            ; Target position is not in content area - clear it and use current position
+            mouseClickTargetPos := 0
+            useTargetPos := false
+            LogActivity("Mouse Click", "Target position invalid (not in content area) - using current position")
+        }
+    }
+
+    ; If no target position set or invalid, use current mouse position
+    if (!useTargetPos) {
+        MouseGetPos(&targetX, &targetY)
+    }
+
+    ; Check if target position is in content area
+    if (!IsInContentArea(targetX, targetY)) {
+        ; Target is not in content area - move to a safe content area position
+        screenWidth := A_ScreenWidth
+        screenHeight := A_ScreenHeight
+
+        ; Move to center of content area (safe zone)
+        targetX := Random(screenWidth * 0.2, screenWidth * 0.8)
+        targetY := Random(screenHeight * 0.15, screenHeight * 0.85)
+
+        ; Move smoothly to safe position
+        MouseMoveSmooth(targetX, targetY, Random(1, 2))
+        Sleep(Random(100, 200))
+
+        ; Update position after movement
+        MouseGetPos(&targetX, &targetY)
+
+        ; Double-check we're in content area after movement
+        if (!IsInContentArea(targetX, targetY)) {
+            ; Still not in content area - skip clicking
+            LogActivity("Mouse Click", "Skipped - mouse not in content area")
+            return
+        }
+    } else if (useTargetPos) {
+        ; Target position is set and valid - move to it first
+        MouseMoveSmooth(targetX, targetY, Random(1, 2))
+        Sleep(Random(100, 200))
+    }
+
+    ; Store final position for logging
+    currentX := targetX
+    currentY := targetY
+
+    ; Mouse is in content area - proceed with clicks
+    ; Random number of clicks (8-12 clicks, with 10 as typical)
+    clickCount := Random(8, 12)
+
+    ; Total duration should be 1-3 seconds
+    totalDuration := Random(1000, 3000)
+
+    ; Calculate delay between clicks to fit within total duration
+    delayBetweenClicks := Round(totalDuration / clickCount)
+
+    ; Ensure minimum delay between clicks (at least 50ms for natural feel)
+    if (delayBetweenClicks < 50) {
+        delayBetweenClicks := 50
+        ; Recalculate total duration if needed
+        totalDuration := clickCount * delayBetweenClicks
+    }
+
+    ; Perform clicks
+    currentActivity := "🖱️ Mouse Click - " . clickCount . " left-clicks in content area"
+
+    loop clickCount {
+        ; Perform left-click at current position
+        Click()
+
+        ; Natural delay between clicks (with small random variation)
+        if (A_Index < clickCount) {
+            ; Add small random variation to delay (±10ms)
+            actualDelay := delayBetweenClicks + Random(-10, 10)
+            if (actualDelay < 30) {
+                actualDelay := 30  ; Minimum 30ms delay
+            }
+            Sleep(actualDelay)
+        }
+    }
+
+    ; Log activity
+    positionSource := useTargetPos ? " (target position)" : " (current position)"
+    LogActivity("Mouse Click", clickCount . " left-clicks at (" . currentX . "," . currentY . ")" . positionSource .
+        " in " . Round(totalDuration) . "ms")
+}
+
+; ============================================
 ; WINDOW SWITCHING (ALT+TAB)
 ; ============================================
 PerformWindowSwitch() {
@@ -1004,7 +1166,7 @@ PerformKeyPresses() {
 ; ============================================
 SimulateHuman() {
     global simulationActive, pausedByUser, scriptActionInProgress
-    global scriptActionStartTime, scriptActionEndTime
+    global scriptActionStartTime, scriptActionEndTime, eventEnabled
 
     if (!simulationActive || pausedByUser) {
         return
@@ -1016,34 +1178,88 @@ SimulateHuman() {
     ; Set flag to indicate script is performing actions (prevents self-pause)
     scriptActionInProgress := true
 
-    ; Random action distribution: 30% mouse, 30% scroll, 25% keys, 10% window switch, 5% hardware
-    ; Scroll has 30% ratio as standalone action, plus automatic scroll after mouse movement
-    randAction := Random(1, 100)
+    ; Build list of enabled events with their weight ranges
+    ; Original distribution: 25% mouse, 25% scroll, 20% keys, 15% mouse clicks, 10% window switch, 5% hardware
+    enabledEvents := []
+    if (eventEnabled["MouseMovement"]) {
+        enabledEvents.Push({ name: "MouseMovement", min: 1, max: 25 })
+    }
+    if (eventEnabled["ScrollWheel"]) {
+        enabledEvents.Push({ name: "ScrollWheel", min: 26, max: 50 })
+    }
+    if (eventEnabled["KeyPresses"]) {
+        enabledEvents.Push({ name: "KeyPresses", min: 51, max: 70 })
+    }
+    if (eventEnabled["MouseClicks"]) {
+        enabledEvents.Push({ name: "MouseClicks", min: 71, max: 85 })
+    }
+    if (eventEnabled["WindowSwitch"]) {
+        enabledEvents.Push({ name: "WindowSwitch", min: 86, max: 95 })
+    }
+    if (eventEnabled["HardwareAdjust"]) {
+        enabledEvents.Push({ name: "HardwareAdjust", min: 96, max: 100 })
+    }
+
+    ; If no events are enabled, skip this action
+    if (enabledEvents.Length == 0) {
+        scriptActionInProgress := false
+        SetTimer(SimulateHuman, Random(5000, 10000))
+        return
+    }
+
+    ; Calculate total weight and select from enabled events
+    totalWeight := 0
+    for event in enabledEvents {
+        totalWeight += (event.max - event.min + 1)
+    }
+
+    ; Select random value within total weight
+    randAction := Random(1, totalWeight)
+
+    ; Find which event this corresponds to
+    cumulativeWeight := 0
+    selectedEvent := ""
+    for event in enabledEvents {
+        eventWeight := (event.max - event.min + 1)
+        if (randAction <= cumulativeWeight + eventWeight) {
+            selectedEvent := event.name
+            ; Calculate original randAction value for compatibility with existing code
+            randAction := event.min + (randAction - cumulativeWeight - 1)
+            break
+        }
+        cumulativeWeight += eventWeight
+    }
 
     ; Log simulation start
     LogActivity("Simulation", "Action triggered")
 
-    if (randAction <= 30) {
-        ; Mouse movement (30%) - scroll will trigger automatically 10 seconds after this
+    ; Execute selected event
+    if (selectedEvent == "MouseMovement") {
+        ; Mouse movement (25%) - scroll will trigger automatically 10 seconds after this
         currentActivity := "🖱️ Mouse Movement - Random paths & oval shapes"
         PerformMouseMovement()
         currentActivity := "✅ Mouse Movement Complete (scroll scheduled in 10s)"
-    } else if (randAction <= 60) {
-        ; Scroll wheel (30%) - standalone scroll action
+    } else if (selectedEvent == "ScrollWheel") {
+        ; Scroll wheel (25%) - standalone scroll action
         currentActivity := "🖱️ Mouse Scroll - Random scroll up/down"
         PerformScrollWheel()
         currentActivity := "✅ Scroll Complete"
-    } else if (randAction <= 85) {
-        ; Key presses (25%)
+    } else if (selectedEvent == "KeyPresses") {
+        ; Key presses (20%)
         currentActivity := "⌨️ Key Press - Sending modifier keys"
         PerformKeyPresses()
         currentActivity := "✅ Key Press Complete"
-    } else if (randAction <= 95) {
+    } else if (selectedEvent == "MouseClicks") {
+        ; Mouse clicks (15%) - multiple left-clicks in content area
+        currentActivity := "🖱️ Mouse Click - Multiple left-clicks in content area"
+        PerformMouseClicks()
+        currentActivity := "✅ Mouse Click Complete"
+    } else if (selectedEvent == "WindowSwitch") {
         ; Window switching with Alt+Tab (10%)
         currentActivity := "🪟 Window Switch - Switching between windows (Alt+Tab)"
         PerformWindowSwitch()
         currentActivity := "✅ Window Switch Complete"
-    } else {
+    } else if (selectedEvent == "HardwareAdjust") {
         ; Hardware adjustment - brightness/volume (5% - natural laptop usage)
         currentActivity := "⚙️ Hardware Adjust - Adjusting brightness/volume"
         PerformHardwareAdjust()
@@ -1053,16 +1269,19 @@ SimulateHuman() {
     ; Mark script action end time and clear flag after action completes
     ; This allows input detection to distinguish between script actions and human input
     ; Calculate delay based on action type to ensure action is fully complete
-    if (randAction <= 30) {
+    if (randAction <= 25) {
         ; Mouse movement - speedy, clear after 500ms (longer for oval shapes that repeat 10-15x)
         ; Oval shapes take longer due to 10-15 repetitions
         SetTimer(ClearScriptActionFlag, -500)
-    } else if (randAction <= 60) {
+    } else if (randAction <= 50) {
         ; Scroll wheel - quick, clear after 200ms
         SetTimer(ClearScriptActionFlag, -200)
-    } else if (randAction <= 85) {
+    } else if (randAction <= 70) {
         ; Key presses - quick, clear after 300ms
         SetTimer(ClearScriptActionFlag, -300)
+    } else if (randAction <= 85) {
+        ; Mouse clicks - takes 1-3 seconds, clear after 3.5 seconds
+        SetTimer(ClearScriptActionFlag, -3500)
     } else if (randAction <= 95) {
         ; Window switch - takes a few seconds, clear after 3 seconds
         SetTimer(ClearScriptActionFlag, -3000)
@@ -1073,14 +1292,17 @@ SimulateHuman() {
 
     ; Schedule next action - reduced to 5-10 seconds (random but less than before)
     ; All actions now happen more frequently for better activity simulation
-    if (randAction <= 30) {
+    if (randAction <= 25) {
         ; Mouse movement - every 5-10 seconds (speedy)
         nextDelay := Random(5000, 10000)
-    } else if (randAction <= 60) {
+    } else if (randAction <= 50) {
         ; Scroll wheel - every 5-10 seconds (speedy)
         nextDelay := Random(5000, 10000)
-    } else if (randAction <= 85) {
+    } else if (randAction <= 70) {
         ; Key presses - every 5-10 seconds (reduced from 8-15)
+        nextDelay := Random(5000, 10000)
+    } else if (randAction <= 85) {
+        ; Mouse clicks - every 5-10 seconds
         nextDelay := Random(5000, 10000)
     } else if (randAction <= 95) {
         ; Window switch - every 5-10 seconds (reduced, more frequent)
@@ -1135,6 +1357,427 @@ SimulateHuman() {
     ToggleRealtimeMonitor()
 }
 
+^!+c:: {  ; Ctrl+Alt+Shift+C: Set Mouse Click Target Position
+    global mouseClickTargetPos
+
+    ; Create live position picker window
+    pickerGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox -MinimizeBox", "Select Target Position")
+    pickerGui.SetFont("s10", "Segoe UI")
+
+    ; Instructions
+    pickerGui.Add("Text", "x10 y10 w380 Center", "Click anywhere to select target position")
+    pickerGui.Add("Text", "x10 y35 w380 Center cGray", "First click will be captured")
+
+    ; Position display (will be updated)
+    posText := pickerGui.Add("Text", "x10 y65 w380 Center vPosText", "Position: (0, 0)")
+    posText.SetFont("s12 Bold")
+
+    ; Status text
+    statusText := pickerGui.Add("Text", "x10 y100 w380 Center vStatusText cGray",
+        "Move mouse and click to select position")
+    statusText.SetFont("s9")
+
+    ; Buttons
+    okBtn := pickerGui.Add("Button", "x100 y140 w80 h30 Default", "Confirm")
+    cancelBtn := pickerGui.Add("Button", "x200 y140 w80 h30", "Cancel")
+
+    ; Variables to store captured position
+    capturedX := 0
+    capturedY := 0
+    positionCaptured := false
+    positionConfirmed := false
+    lastMouseState := false
+
+    ; Function to check for first left-click (nested function has access to outer scope)
+    CheckForFirstClick(*) {
+        if (positionCaptured) {
+            return  ; Already captured, stop checking
+        }
+
+        ; Check if left mouse button is pressed
+        currentMouseState := GetKeyState("LButton", "P")
+
+        ; Detect button press (transition from not pressed to pressed)
+        if (currentMouseState && !lastMouseState) {
+            ; Get mouse position at the moment of click
+            MouseGetPos(&capturedX, &capturedY)
+            positionCaptured := true
+
+            ; Update display to show captured position
+            posText.Text := "Position: (" . capturedX . ", " . capturedY . ") ✓"
+            statusText.Text := "Position captured! Click Confirm to save or Cancel to abort"
+            statusText.SetFont("cGreen")
+
+            ; Stop position updates and click detection
+            SetTimer(CheckForFirstClick, 0)
+            SetTimer(() => UpdatePickerPosition(posText, statusText, true), 0)
+        }
+
+        lastMouseState := currentMouseState
+    }
+
+    ; OK button handler - only confirms if position was captured
+    okBtn.OnEvent("Click", (*) => (
+        positionConfirmed := positionCaptured,
+        SetTimer(CheckForFirstClick, 0),
+        pickerGui.Destroy()
+    ))
+
+    ; Cancel button handler
+    cancelBtn.OnEvent("Click", (*) => (
+        SetTimer(CheckForFirstClick, 0),
+        pickerGui.Destroy()
+    ))
+
+    ; Start click detection timer (checks every 10ms for responsive detection)
+    SetTimer(CheckForFirstClick, 10)
+
+    ; Position update timer (updates every 50ms for smooth display)
+    SetTimer(() => UpdatePickerPosition(posText, statusText, positionCaptured), 50)
+
+    ; Show picker window (positioned near center of screen)
+    screenWidth := A_ScreenWidth
+    screenHeight := A_ScreenHeight
+    pickerX := (screenWidth - 400) / 2
+    pickerY := (screenHeight - 200) / 2
+    pickerGui.Show("x" . pickerX . " y" . pickerY . " w400 h180")
+
+    ; Wait for window to close
+    WinWaitClose("ahk_id " . pickerGui.Hwnd)
+
+    ; Stop all timers
+    SetTimer(CheckForFirstClick, 0)
+    SetTimer(() => UpdatePickerPosition(posText, statusText, positionCaptured), 0)
+
+    ; If position was confirmed, validate and set it
+    if (positionConfirmed && positionCaptured && capturedX > 0 && capturedY > 0) {
+        finalX := capturedX
+        finalY := capturedY
+
+        ; Get screen dimensions for validation
+        screenWidth := A_ScreenWidth
+        screenHeight := A_ScreenHeight
+
+        ; Very lenient check
+        topMarginLenient := 20
+        bottomMarginLenient := 30
+        leftMarginLenient := 1
+        rightMarginLenient := 1
+
+        isInLenientArea := (finalY >= topMarginLenient && finalY <= (screenHeight - bottomMarginLenient)
+        && finalX >= leftMarginLenient && finalX <= (screenWidth - rightMarginLenient))
+
+        ; Check if in strict content area (for warning)
+        isInStrictArea := IsInContentArea(finalX, finalY)
+
+        if (!isInLenientArea) {
+            ; Position is too close to edges
+            MsgBox(
+                "Selected position is too close to screen edges!`n`n" .
+                "Position: (" . finalX . ", " . finalY . ")`n" .
+                "Screen: " . screenWidth . " x " . screenHeight . "`n`n" .
+                "Please select a position in a more central area.",
+                "Position Too Close to Edges",
+                "OK"
+            )
+            return
+        }
+
+        ; Store target position
+        mouseClickTargetPos := { x: finalX, y: finalY }
+
+        ; Show warning if not in strict area but allow it
+        warningMsg := ""
+        if (!isInStrictArea) {
+            warningMsg := "`n`n⚠️ Note: This position is near screen edges.`n" .
+                "The script will validate the position before each click action."
+        }
+
+        ; Show confirmation
+        settingsWinTitle := "General Settings"
+        msgBoxText := "✓ Mouse click target position set!`n`n" .
+            "Position: (" . finalX . ", " . finalY . ")`n" .
+            "Screen: " . screenWidth . " x " . screenHeight . warningMsg . "`n`n" .
+            "Multiple left-click actions will now be performed at this position.`n`n" .
+            "Press Ctrl+Alt+Shift+C again to set a new position,`n" .
+            "or use General Settings (Ctrl+Alt+Shift+S) to view/clear it."
+
+        if (WinExist(settingsWinTitle)) {
+            try {
+                WinGetPos(&settingsX, &settingsY, &settingsW, &settingsH, settingsWinTitle)
+                msgBoxHeight := 240
+                msgBoxWidth := 420
+                msgX := settingsX + 25
+                msgY := Max(10, settingsY - msgBoxHeight - 10)
+
+                msgGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox -MinimizeBox", "Target Position Set")
+                msgGui.SetFont("s10", "Segoe UI")
+                msgGui.Add("Text", "x10 y10 w400", msgBoxText)
+                okBtn2 := msgGui.Add("Button", "x170 y200 w80 h30 Default", "OK")
+                okBtn2.OnEvent("Click", (*) => msgGui.Destroy())
+                msgGui.Show("x" . msgX . " y" . msgY . " w" . msgBoxWidth . " h" . msgBoxHeight)
+                WinActivate("ahk_id " . msgGui.Hwnd)
+                WinWaitClose("ahk_id " . msgGui.Hwnd)
+                UpdateSettingsWindowTargetPosition()
+            } catch {
+                MsgBox(msgBoxText, "Target Position Set", "OK")
+                UpdateSettingsWindowTargetPosition()
+            }
+        } else {
+            MsgBox(msgBoxText, "Target Position Set", "OK")
+            UpdateSettingsWindowTargetPosition()
+        }
+
+        LogActivity("Mouse Click Target", "Set to (" . finalX . ", " . finalY . ")")
+    }
+}
+
+; Global reference to settings GUI controls for updating
+globalSettingsGuiControls := 0
+
+; Function to update target position display in General Settings window
+UpdateSettingsWindowTargetPosition() {
+    global globalSettingsGuiControls, mouseClickTargetPos
+
+    if (globalSettingsGuiControls == 0) {
+        return  ; No controls stored
+    }
+
+    try {
+        controls := globalSettingsGuiControls
+        if (mouseClickTargetPos != 0 && mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y")) {
+            ; Update to show position
+            controls.clickTargetText.Text := "Position: (" . mouseClickTargetPos.x . ", " . mouseClickTargetPos.y . ")"
+            controls.clickTargetText.SetFont("cBlack")
+            controls.clearTargetBtn.Enabled := true
+        } else {
+            ; Update to show no position
+            controls.clickTargetText.Text := "No target position set"
+            controls.clickTargetText.SetFont("cGray")
+            controls.clearTargetBtn.Enabled := false
+        }
+    } catch {
+        ; If update fails, that's okay
+    }
+}
+
+; Function to set target position from GUI button - shows live position picker
+SetTargetPositionFromGUI(clickTargetText, setTargetBtn, clearTargetBtn, settingsGui, *) {
+    global mouseClickTargetPos
+
+    ; Create live position picker window
+    pickerGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox -MinimizeBox", "Select Target Position")
+    pickerGui.SetFont("s10", "Segoe UI")
+
+    ; Instructions
+    pickerGui.Add("Text", "x10 y10 w380 Center", "Click anywhere to select target position")
+    pickerGui.Add("Text", "x10 y35 w380 Center cGray", "First click will be captured")
+
+    ; Position display (will be updated)
+    posText := pickerGui.Add("Text", "x10 y65 w380 Center vPosText", "Position: (0, 0)")
+    posText.SetFont("s12 Bold")
+
+    ; Status text
+    statusText := pickerGui.Add("Text", "x10 y100 w380 Center vStatusText cGray",
+        "Move mouse and click to select position")
+    statusText.SetFont("s9")
+
+    ; Buttons
+    okBtn := pickerGui.Add("Button", "x100 y140 w80 h30 Default", "Confirm")
+    cancelBtn := pickerGui.Add("Button", "x200 y140 w80 h30", "Cancel")
+
+    ; Variables to store captured position
+    capturedX := 0
+    capturedY := 0
+    positionCaptured := false
+    positionConfirmed := false
+    lastMouseState := false
+
+    ; Function to check for first left-click (nested function has access to outer scope)
+    CheckForFirstClick(*) {
+        if (positionCaptured) {
+            return  ; Already captured, stop checking
+        }
+
+        ; Check if left mouse button is pressed
+        currentMouseState := GetKeyState("LButton", "P")
+
+        ; Detect button press (transition from not pressed to pressed)
+        if (currentMouseState && !lastMouseState) {
+            ; Get mouse position at the moment of click
+            MouseGetPos(&capturedX, &capturedY)
+            positionCaptured := true
+
+            ; Update display to show captured position
+            posText.Text := "Position: (" . capturedX . ", " . capturedY . ") ✓"
+            statusText.Text := "Position captured! Click Confirm to save or Cancel to abort"
+            statusText.SetFont("cGreen")
+
+            ; Stop position updates and click detection
+            SetTimer(CheckForFirstClick, 0)
+            SetTimer(() => UpdatePickerPosition(posText, statusText, true), 0)
+        }
+
+        lastMouseState := currentMouseState
+    }
+
+    ; OK button handler - only confirms if position was captured
+    okBtn.OnEvent("Click", (*) => (
+        positionConfirmed := positionCaptured,
+        SetTimer(CheckForFirstClick, 0),
+        pickerGui.Destroy()
+    ))
+
+    ; Cancel button handler
+    cancelBtn.OnEvent("Click", (*) => (
+        SetTimer(CheckForFirstClick, 0),
+        pickerGui.Destroy()
+    ))
+
+    ; Start click detection timer (checks every 10ms for responsive detection)
+    SetTimer(CheckForFirstClick, 10)
+
+    ; Position update timer (updates every 50ms for smooth display)
+    SetTimer(() => UpdatePickerPosition(posText, statusText, positionCaptured), 50)
+
+    ; Show picker window (positioned near center of screen)
+    screenWidth := A_ScreenWidth
+    screenHeight := A_ScreenHeight
+    pickerX := (screenWidth - 400) / 2
+    pickerY := (screenHeight - 200) / 2
+    pickerGui.Show("x" . pickerX . " y" . pickerY . " w400 h180")
+
+    ; Wait for window to close
+    WinWaitClose("ahk_id " . pickerGui.Hwnd)
+
+    ; Stop all timers
+    SetTimer(CheckForFirstClick, 0)
+    SetTimer(() => UpdatePickerPosition(posText, statusText, positionCaptured), 0)
+
+    ; If position was confirmed, validate and set it
+    if (positionConfirmed && positionCaptured && capturedX > 0 && capturedY > 0) {
+        finalX := capturedX
+        finalY := capturedY
+
+        ; Get screen dimensions for validation
+        screenWidth := A_ScreenWidth
+        screenHeight := A_ScreenHeight
+
+        ; Very lenient check
+        topMarginLenient := 20
+        bottomMarginLenient := 30
+        leftMarginLenient := 1
+        rightMarginLenient := 1
+
+        isInLenientArea := (finalY >= topMarginLenient && finalY <= (screenHeight - bottomMarginLenient)
+        && finalX >= leftMarginLenient && finalX <= (screenWidth - rightMarginLenient))
+
+        ; Check if in strict content area (for warning)
+        isInStrictArea := IsInContentArea(finalX, finalY)
+
+        if (!isInLenientArea) {
+            ; Position is too close to edges
+            MsgBox(
+                "Selected position is too close to screen edges!`n`n" .
+                "Position: (" . finalX . ", " . finalY . ")`n" .
+                "Screen: " . screenWidth . " x " . screenHeight . "`n`n" .
+                "Please select a position in a more central area.",
+                "Position Too Close to Edges",
+                "OK"
+            )
+            return
+        }
+
+        ; Store target position
+        mouseClickTargetPos := { x: finalX, y: finalY }
+
+        ; Update GUI controls
+        try {
+            clickTargetText.Text := "Position: (" . finalX . ", " . finalY . ")"
+            clickTargetText.SetFont("cBlack")
+            clearTargetBtn.Enabled := true
+        } catch {
+            ; If update fails, continue anyway
+        }
+
+        ; Show confirmation (positioned above settings window)
+        settingsWinTitle := "General Settings"
+        warningMsg := ""
+        if (!isInStrictArea) {
+            warningMsg := "`n`n⚠️ Note: This position is near screen edges."
+        }
+
+        msgBoxText := "✓ Mouse click target position set!`n`n" .
+            "Position: (" . finalX . ", " . finalY . ")" . warningMsg
+
+        if (WinExist(settingsWinTitle)) {
+            try {
+                WinGetPos(&settingsX, &settingsY, &settingsW, &settingsH, settingsWinTitle)
+                msgBoxHeight := 140
+                msgBoxWidth := 420
+                msgX := settingsX + 25
+                msgY := Max(10, settingsY - msgBoxHeight - 10)
+
+                msgGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox -MinimizeBox", "Target Position Set")
+                msgGui.SetFont("s10", "Segoe UI")
+                msgGui.Add("Text", "x10 y10 w400", msgBoxText)
+                okBtn2 := msgGui.Add("Button", "x170 y100 w80 h30 Default", "OK")
+                okBtn2.OnEvent("Click", (*) => msgGui.Destroy())
+                msgGui.Show("x" . msgX . " y" . msgY . " w" . msgBoxWidth . " h" . msgBoxHeight)
+                WinActivate("ahk_id " . msgGui.Hwnd)
+                WinWaitClose("ahk_id " . msgGui.Hwnd)
+                ; Update the settings window display after closing message
+                UpdateSettingsWindowTargetPosition()
+            } catch {
+                MsgBox(msgBoxText, "Target Position Set", "OK")
+                UpdateSettingsWindowTargetPosition()
+            }
+        } else {
+            MsgBox(msgBoxText, "Target Position Set", "OK")
+            UpdateSettingsWindowTargetPosition()
+        }
+
+        LogActivity("Mouse Click Target", "Set to (" . finalX . ", " . finalY . ") from GUI")
+    }
+}
+
+; Function to update position display in picker window
+UpdatePickerPosition(posTextCtrl, statusTextCtrl, positionCaptured := false) {
+    ; Check if controls still exist (window might be closed)
+    try {
+        ; If position already captured, don't update
+        if (positionCaptured) {
+            return
+        }
+
+        MouseGetPos(&currentX, &currentY)
+
+        ; Update position text
+        posTextCtrl.Text := "Position: (" . currentX . ", " . currentY . ")"
+
+        ; Update status based on position validity
+        screenWidth := A_ScreenWidth
+        screenHeight := A_ScreenHeight
+        topMarginLenient := 20
+        bottomMarginLenient := 30
+        leftMarginLenient := 1
+        rightMarginLenient := 1
+
+        isInLenientArea := (currentY >= topMarginLenient && currentY <= (screenHeight - bottomMarginLenient)
+        && currentX >= leftMarginLenient && currentX <= (screenWidth - rightMarginLenient))
+
+        if (isInLenientArea) {
+            statusTextCtrl.Text := "✓ Valid position - Click anywhere to select"
+            statusTextCtrl.SetFont("cGreen")
+        } else {
+            statusTextCtrl.Text := "⚠ Position too close to edges"
+            statusTextCtrl.SetFont("cRed")
+        }
+    } catch {
+        ; Window closed or controls invalid - timer will be stopped
+    }
+}
+
 TogglePauseState(trigger := "User") {
     global simulationActive, pausedByUser, currentActivity
 
@@ -1162,6 +1805,58 @@ scheduledQuitTime := 0
 ; ============================================
 ; NEW FEATURE: GENERAL SETTINGS
 ; ============================================
+; Function to load event settings from INI file
+LoadEventSettings() {
+    global eventEnabled, settingsIniPath
+
+    ; Default: all events enabled
+    defaultEvents := Map(
+        "MouseMovement", true,
+        "ScrollWheel", true,
+        "KeyPresses", true,
+        "MouseClicks", true,
+        "WindowSwitch", true,
+        "HardwareAdjust", true
+    )
+
+    ; If INI file doesn't exist, use defaults
+    if (!FileExist(settingsIniPath)) {
+        eventEnabled := defaultEvents.Clone()
+        return
+    }
+
+    ; Load from INI file
+    try {
+        for eventName, defaultValue in defaultEvents {
+            value := IniRead(settingsIniPath, "Events", eventName, defaultValue ? "1" : "0")
+            eventEnabled[eventName] := (value == "1")
+        }
+    } catch {
+        ; If reading fails, use defaults
+        eventEnabled := defaultEvents.Clone()
+    }
+}
+
+; Function to save event settings to INI file
+SaveEventSettings() {
+    global eventEnabled, settingsIniPath
+
+    try {
+        ; Create INI file if it doesn't exist
+        if (!FileExist(settingsIniPath)) {
+            FileAppend("", settingsIniPath)
+        }
+
+        ; Write each event state
+        for eventName, enabled in eventEnabled {
+            IniWrite(enabled ? "1" : "0", settingsIniPath, "Events", eventName)
+        }
+    } catch {
+        ; If writing fails, log error but don't crash
+        LogActivity("Settings", "Failed to save event settings to INI file")
+    }
+}
+
 ; Custom hotkey: Ctrl+Alt+Shift+S (unused by browsers, Windows, or editors)
 ^!+s:: {  ; Ctrl+Alt+Shift+S: Open General Settings
     ShowGeneralSettings()
@@ -1169,7 +1864,7 @@ scheduledQuitTime := 0
 
 ; Function to show general settings dialog
 ShowGeneralSettings() {
-    global inactivityThreshold, inactivityJitter, actionBufferTime
+    global inactivityThreshold, inactivityJitter, actionBufferTime, mouseClickTargetPos, eventEnabled
 
     ; Store original default values from global variables (these are the script defaults)
     ; These values come from the GLOBAL VARIABLES section at the top of the script
@@ -1178,8 +1873,8 @@ ShowGeneralSettings() {
     defaultInactivityJitter := 1000      ; From global: inactivityJitter
     defaultActionBufferTime := 3000      ; From global: actionBufferTime
 
-    ; Create GUI for settings (resizable)
-    settingsGui := Gui("+AlwaysOnTop +Resize", "General Settings")
+    ; Create GUI for settings (resizable with minimum size to prevent scrolling)
+    settingsGui := Gui("+AlwaysOnTop +Resize +MinSize470x555", "General Settings")
     settingsGui.SetFont("s10", "Segoe UI")
 
     ; Calculate default values for display (from global variables)
@@ -1188,53 +1883,162 @@ ShowGeneralSettings() {
     defaultBufferSec := Round(defaultActionBufferTime / 1000)
 
     ; Inactivity Threshold (seconds)
-    settingsGui.Add("Text", "x20 y20 w400", "Inactivity Threshold (seconds):")
-    settingsGui.Add("Text", "x20 y35 w400 cGray",
+    thresholdLabel1 := settingsGui.Add("Text", "x20 y20 w400", "Inactivity Threshold (seconds):")
+    thresholdLabel2 := settingsGui.Add("Text", "x20 y35 w400 cGray",
         "How long to wait before starting activity simulation (when user is idle)")
     thresholdEdit := settingsGui.Add("Edit", "x20 y55 w200", Round(inactivityThreshold / 1000))
     thresholdEdit.SetFont("s10", "Segoe UI")
-    settingsGui.Add("Text", "x230 y57 w150", "Default: " . defaultThresholdSec . " seconds")
+    thresholdDefaultText := settingsGui.Add("Text", "x230 y57 w150", "Default: " . defaultThresholdSec . " seconds"
+    )
 
     ; Inactivity Jitter (seconds)
-    settingsGui.Add("Text", "x20 y100 w400", "Inactivity Jitter (±seconds):")
-    settingsGui.Add("Text", "x20 y115 w400 cGray", "Random variation added to threshold to avoid fixed timing patterns"
+    jitterLabel1 := settingsGui.Add("Text", "x20 y100 w400", "Inactivity Jitter (±seconds):")
+    jitterLabel2 := settingsGui.Add("Text", "x20 y115 w400 cGray",
+        "Random variation added to threshold to avoid fixed timing patterns"
     )
     jitterEdit := settingsGui.Add("Edit", "x20 y135 w200", Round(inactivityJitter / 1000))
     jitterEdit.SetFont("s10", "Segoe UI")
-    settingsGui.Add("Text", "x230 y137 w150", "Default: ±" . defaultJitterSec . " second")
+    jitterDefaultText := settingsGui.Add("Text", "x230 y137 w150", "Default: ±" . defaultJitterSec . " second")
 
     ; Action Buffer Time (seconds)
-    settingsGui.Add("Text", "x20 y180 w400", "Action Buffer Time (seconds):")
-    settingsGui.Add("Text", "x20 y195 w400 cGray", "Delay after script actions before checking for real user input")
+    bufferLabel1 := settingsGui.Add("Text", "x20 y180 w400", "Action Buffer Time (seconds):")
+    bufferLabel2 := settingsGui.Add("Text", "x20 y195 w400 cGray",
+        "Delay after script actions before checking for real user input")
     bufferEdit := settingsGui.Add("Edit", "x20 y215 w200", Round(actionBufferTime / 1000))
     bufferEdit.SetFont("s10", "Segoe UI")
-    settingsGui.Add("Text", "x230 y217 w150", "Default: " . defaultBufferSec . " seconds")
+    bufferDefaultText := settingsGui.Add("Text", "x230 y217 w150", "Default: " . defaultBufferSec . " seconds")
+
+    ; Mouse Click Target Position
+    clickTargetLabel1 := settingsGui.Add("Text", "x20 y260 w400", "Mouse Click Target Position:")
+    clickTargetLabel2 := settingsGui.Add("Text", "x20 y275 w400 cGray",
+        "Pre-selected position for multiple left-click actions")
+    if (mouseClickTargetPos != 0 && mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y")) {
+        clickTargetText := settingsGui.Add("Text", "x20 y295 w200", "Position: (" . mouseClickTargetPos.x . ", " .
+            mouseClickTargetPos.y . ")")
+        setTargetBtn := settingsGui.Add("Button", "x230 y290 w100 h25", "Set Target")
+        clearTargetBtn := settingsGui.Add("Button", "x340 y290 w100 h25", "Clear Target")
+    } else {
+        clickTargetText := settingsGui.Add("Text", "x20 y295 w200 cGray", "No target position set")
+        setTargetBtn := settingsGui.Add("Button", "x230 y290 w100 h25", "Set Target")
+        clearTargetBtn := settingsGui.Add("Button", "x340 y290 w100 h25 Disabled", "Clear Target")
+    }
+
+    ; Enabled Events Section
+    eventsLabel1 := settingsGui.Add("Text", "x20 y340 w400", "Enabled Events:")
+    eventsLabel2 := settingsGui.Add("Text", "x20 y355 w400 cGray",
+        "Select which events should be simulated (all selected by default)")
+
+    ; Event checkboxes (2 columns)
+    eventCheckboxes := Map()
+    eventCheckboxes["MouseMovement"] := settingsGui.Add("Checkbox", "x20 y380 w200", "Mouse Movement")
+    eventCheckboxes["ScrollWheel"] := settingsGui.Add("Checkbox", "x20 y405 w200", "Scroll Wheel")
+    eventCheckboxes["KeyPresses"] := settingsGui.Add("Checkbox", "x20 y430 w200", "Key Presses")
+    eventCheckboxes["MouseClicks"] := settingsGui.Add("Checkbox", "x240 y380 w200", "Mouse Clicks")
+    eventCheckboxes["WindowSwitch"] := settingsGui.Add("Checkbox", "x240 y405 w200", "Window Switch (Alt+Tab)")
+    eventCheckboxes["HardwareAdjust"] := settingsGui.Add("Checkbox", "x240 y430 w200", "Hardware Adjust")
+
+    ; Set checkbox values from current settings
+    for eventName, checkbox in eventCheckboxes {
+        checkbox.Value := eventEnabled[eventName] ? 1 : 0
+    }
 
     ; Info text
-    settingsGui.Add("Text", "x20 y260 w400 cGray",
+    noteText := settingsGui.Add("Text", "x20 y465 w400 cGray",
         "Note: Changes take effect immediately.`nRestart script to fully apply changes.")
 
     ; Buttons (Cancel acts as close button)
-    saveBtn := settingsGui.Add("Button", "x120 y300 w100 h30 Default", "Save")
-    cancelBtn := settingsGui.Add("Button", "x230 y300 w100 h30", "Close")
-    resetBtn := settingsGui.Add("Button", "x20 y300 w90 h30", "Reset")
+    saveBtn := settingsGui.Add("Button", "x120 y505 w100 h30 Default", "Save")
+    cancelBtn := settingsGui.Add("Button", "x230 y505 w100 h30", "Close")
+    resetBtn := settingsGui.Add("Button", "x20 y505 w90 h30", "Reset")
+
+    ; Store controls globally for updating
+    global globalSettingsGuiControls
+    globalSettingsGuiControls := { clickTargetText: clickTargetText, setTargetBtn: setTargetBtn, clearTargetBtn: clearTargetBtn }
+
+    ; Clean up global reference when window closes
+    settingsGui.OnEvent("Close", (*) => (
+        globalSettingsGuiControls := 0
+    ))
 
     ; Button handlers using closures
-    saveBtn.OnEvent("Click", SaveSettingsHandler.Bind(thresholdEdit, jitterEdit, bufferEdit, settingsGui))
-    cancelBtn.OnEvent("Click", (*) => settingsGui.Destroy())
+    saveBtn.OnEvent("Click", SaveSettingsHandler.Bind(thresholdEdit, jitterEdit, bufferEdit, eventCheckboxes,
+        settingsGui))
+    cancelBtn.OnEvent("Click", (*) => (globalSettingsGuiControls := 0, settingsGui.Destroy()))
     resetBtn.OnEvent("Click", ResetSettingsHandler.Bind(thresholdEdit, jitterEdit, bufferEdit, defaultThresholdSec,
         defaultJitterSec, defaultBufferSec))
+    setTargetBtn.OnEvent("Click", SetTargetPositionFromGUI.Bind(clickTargetText, setTargetBtn, clearTargetBtn,
+        settingsGui))
+    clearTargetBtn.OnEvent("Click", ClearClickTargetHandler.Bind(clickTargetText, setTargetBtn, clearTargetBtn,
+        settingsGui))
 
-    ; Handle window resize
-    settingsGui.OnEvent("Size", ResizeGeneralSettings.Bind(thresholdEdit, jitterEdit, bufferEdit))
+    ; Handle window resize - pass all controls that need resizing and settingsGui
+    settingsGui.OnEvent("Size", ResizeGeneralSettings.Bind(thresholdEdit, jitterEdit, bufferEdit,
+        thresholdLabel1, thresholdLabel2, thresholdDefaultText,
+        jitterLabel1, jitterLabel2, jitterDefaultText,
+        bufferLabel1, bufferLabel2, bufferDefaultText,
+        clickTargetLabel1, clickTargetLabel2, clickTargetText, setTargetBtn, clearTargetBtn,
+        eventsLabel1, eventsLabel2, eventCheckboxes,
+        noteText, saveBtn, cancelBtn, resetBtn, settingsGui))
 
-    ; Show GUI (resizable)
-    settingsGui.Show("w450 h350")
+    ; Show window
+    settingsGui.Show("w470 h555")
+}
+
+; Helper function to show always-on-top message
+ShowAlwaysOnTopMessage(message, title) {
+    settingsWinTitle := "General Settings"
+
+    ; Check if settings window exists and get its position
+    if (WinExist(settingsWinTitle)) {
+        try {
+            ; Get settings window position
+            WinGetPos(&settingsX, &settingsY, &settingsW, &settingsH, settingsWinTitle)
+            ; Calculate message box position (above settings window)
+            msgBoxHeight := 120
+            msgBoxWidth := 400
+            msgX := settingsX + 25
+            msgY := Max(10, settingsY - msgBoxHeight - 10)  ; Ensure it's on screen
+
+            ; Create a custom message GUI positioned above the settings window
+            msgGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox -MinimizeBox", title)
+            msgGui.SetFont("s10", "Segoe UI")
+            msgGui.Add("Text", "x10 y10 w380", message)
+            okBtn := msgGui.Add("Button", "x160 y80 w80 h30 Default", "OK")
+            okBtn.OnEvent("Click", (*) => msgGui.Destroy())
+            ; Position above settings window
+            msgGui.Show("x" . msgX . " y" . msgY . " w" . msgBoxWidth . " h" . msgBoxHeight)
+            ; Bring to front
+            WinActivate("ahk_id " . msgGui.Hwnd)
+            ; Wait for user to close
+            WinWaitClose("ahk_id " . msgGui.Hwnd)
+        } catch {
+            ; Fallback to regular MsgBox if custom GUI fails
+            MsgBox(message, title, "OK")
+        }
+    } else {
+        ; Settings window not open, center on screen with always on top
+        try {
+            msgGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox -MinimizeBox", title)
+            msgGui.SetFont("s10", "Segoe UI")
+            msgGui.Add("Text", "x10 y10 w380", message)
+            okBtn := msgGui.Add("Button", "x160 y80 w80 h30 Default", "OK")
+            okBtn.OnEvent("Click", (*) => msgGui.Destroy())
+            ; Center on screen
+            msgGui.Show("w400 h120")
+            ; Bring to front
+            WinActivate("ahk_id " . msgGui.Hwnd)
+            ; Wait for user to close
+            WinWaitClose("ahk_id " . msgGui.Hwnd)
+        } catch {
+            ; Fallback to regular MsgBox if custom GUI fails
+            MsgBox(message, title, "OK")
+        }
+    }
 }
 
 ; Function to save settings
-SaveSettingsHandler(thresholdEdit, jitterEdit, bufferEdit, settingsGui, *) {
-    global inactivityThreshold, inactivityJitter, actionBufferTime
+SaveSettingsHandler(thresholdEdit, jitterEdit, bufferEdit, eventCheckboxes, settingsGui, *) {
+    global inactivityThreshold, inactivityJitter, actionBufferTime, eventEnabled
 
     ; Validate and save settings
     thresholdValue := Integer(thresholdEdit.Value)
@@ -1243,19 +2047,19 @@ SaveSettingsHandler(thresholdEdit, jitterEdit, bufferEdit, settingsGui, *) {
 
     ; Validate threshold (1-60 seconds)
     if (thresholdValue < 1 || thresholdValue > 60) {
-        MsgBox("Inactivity Threshold must be between 1 and 60 seconds!", "Invalid Value", "OK")
+        ShowAlwaysOnTopMessage("Inactivity Threshold must be between 1 and 60 seconds!", "Invalid Value")
         return
     }
 
     ; Validate jitter (0-10 seconds)
     if (jitterValue < 0 || jitterValue > 10) {
-        MsgBox("Inactivity Jitter must be between 0 and 10 seconds!", "Invalid Value", "OK")
+        ShowAlwaysOnTopMessage("Inactivity Jitter must be between 0 and 10 seconds!", "Invalid Value")
         return
     }
 
     ; Validate buffer (1-10 seconds)
     if (bufferValue < 1 || bufferValue > 10) {
-        MsgBox("Action Buffer Time must be between 1 and 10 seconds!", "Invalid Value", "OK")
+        ShowAlwaysOnTopMessage("Action Buffer Time must be between 1 and 10 seconds!", "Invalid Value")
         return
     }
 
@@ -1264,16 +2068,68 @@ SaveSettingsHandler(thresholdEdit, jitterEdit, bufferEdit, settingsGui, *) {
     inactivityJitter := jitterValue * 1000
     actionBufferTime := bufferValue * 1000
 
-    ; Show confirmation
-    MsgBox(
-        "Settings saved successfully!`n`n" .
+    ; Save event states from checkboxes
+    for eventName, checkbox in eventCheckboxes {
+        eventEnabled[eventName] := (checkbox.Value == 1)
+    }
+
+    ; Save event settings to INI file
+    SaveEventSettings()
+
+    ; Show confirmation (positioned above settings window, always on top)
+    settingsWinTitle := "General Settings"
+    msgBoxText := "Settings saved successfully!`n`n" .
         "Inactivity Threshold: " . thresholdValue . " seconds`n" .
         "Inactivity Jitter: ±" . jitterValue . " seconds`n" .
         "Action Buffer Time: " . bufferValue . " seconds`n`n" .
-        "Changes are now active.",
-        "Settings Saved",
-        "OK"
-    )
+        "Changes are now active."
+
+    ; Check if settings window exists and get its position
+    if (WinExist(settingsWinTitle)) {
+        try {
+            ; Get settings window position
+            WinGetPos(&settingsX, &settingsY, &settingsW, &settingsH, settingsWinTitle)
+            ; Calculate message box position (above settings window)
+            msgBoxHeight := 200
+            msgBoxWidth := 420
+            msgX := settingsX + 25
+            msgY := Max(10, settingsY - msgBoxHeight - 10)  ; Ensure it's on screen
+
+            ; Create a custom message GUI positioned above the settings window
+            msgGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox -MinimizeBox", "Settings Saved")
+            msgGui.SetFont("s10", "Segoe UI")
+            msgGui.Add("Text", "x10 y10 w400", msgBoxText)
+            okBtn := msgGui.Add("Button", "x170 y160 w80 h30 Default", "OK")
+            okBtn.OnEvent("Click", (*) => msgGui.Destroy())
+            ; Position above settings window
+            msgGui.Show("x" . msgX . " y" . msgY . " w" . msgBoxWidth . " h" . msgBoxHeight)
+            ; Bring to front
+            WinActivate("ahk_id " . msgGui.Hwnd)
+            ; Wait for user to close
+            WinWaitClose("ahk_id " . msgGui.Hwnd)
+        } catch {
+            ; Fallback to regular MsgBox if custom GUI fails
+            MsgBox(msgBoxText, "Settings Saved", "OK")
+        }
+    } else {
+        ; Settings window not open, center on screen with always on top
+        try {
+            msgGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox -MinimizeBox", "Settings Saved")
+            msgGui.SetFont("s10", "Segoe UI")
+            msgGui.Add("Text", "x10 y10 w400", msgBoxText)
+            okBtn := msgGui.Add("Button", "x170 y160 w80 h30 Default", "OK")
+            okBtn.OnEvent("Click", (*) => msgGui.Destroy())
+            ; Center on screen
+            msgGui.Show("w420 h200")
+            ; Bring to front
+            WinActivate("ahk_id " . msgGui.Hwnd)
+            ; Wait for user to close
+            WinWaitClose("ahk_id " . msgGui.Hwnd)
+        } catch {
+            ; Fallback to regular MsgBox if custom GUI fails
+            MsgBox(msgBoxText, "Settings Saved", "OK")
+        }
+    }
 
     LogActivity("Settings", "Updated: Threshold=" . thresholdValue . "s, Jitter=±" . jitterValue . "s, Buffer=" .
         bufferValue . "s")
@@ -1281,20 +2137,232 @@ SaveSettingsHandler(thresholdEdit, jitterEdit, bufferEdit, settingsGui, *) {
 }
 
 ; Function to reset settings to defaults
-ResetSettingsHandler(thresholdEdit, jitterEdit, bufferEdit, defaultThresholdSec, defaultJitterSec, defaultBufferSec, *) {
+ResetSettingsHandler(thresholdEdit, jitterEdit, bufferEdit, defaultThresholdSec, defaultJitterSec, defaultBufferSec, *
+) {
     ; Reset to defaults from global variables
     thresholdEdit.Value := defaultThresholdSec
     jitterEdit.Value := defaultJitterSec
     bufferEdit.Value := defaultBufferSec
 }
 
+; Function to clear mouse click target position
+ClearClickTargetHandler(clickTargetText, setTargetBtn, clearTargetBtn, settingsGui, *) {
+    global mouseClickTargetPos
+
+    ; Clear target position
+    mouseClickTargetPos := 0
+
+    ; Log that the handler was called
+    LogActivity("Mouse Click Target", "Clear button clicked")
+
+    ; Update GUI controls - ensure controls exist and update them
+    try {
+        if (clickTargetText) {
+            clickTargetText.Text := "No target position set"
+            clickTargetText.SetFont("cGray")
+        }
+        if (clearTargetBtn) {
+            clearTargetBtn.Enabled := false
+        }
+    } catch as err {
+        ; Log error but continue
+        LogActivity("Error", "Failed to update GUI controls: " . err.Message)
+    }
+
+    ; Show confirmation (positioned above settings window)
+    settingsWinTitle := "General Settings"
+    msgBoxText := "Mouse click target position cleared!`n`n" .
+        "Multiple left-click actions will now use the current mouse position."
+
+    ; Check if settings window exists and get its position
+    if (WinExist(settingsWinTitle)) {
+        try {
+            ; Get settings window position
+            WinGetPos(&settingsX, &settingsY, &settingsW, &settingsH, settingsWinTitle)
+            ; Calculate message box position (above settings window)
+            msgBoxHeight := 140
+            msgBoxWidth := 420
+            msgX := settingsX + 25
+            msgY := Max(10, settingsY - msgBoxHeight - 10)  ; Ensure it's on screen
+
+            ; Create a custom message GUI positioned above the settings window
+            msgGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox -MinimizeBox", "Target Position Cleared")
+            msgGui.SetFont("s10", "Segoe UI")
+            msgGui.Add("Text", "x10 y10 w400", msgBoxText)
+            okBtn := msgGui.Add("Button", "x170 y100 w80 h30 Default", "OK")
+            okBtn.OnEvent("Click", (*) => msgGui.Destroy())
+            ; Position above settings window
+            msgGui.Show("x" . msgX . " y" . msgY . " w" . msgBoxWidth . " h" . msgBoxHeight)
+            ; Bring to front
+            WinActivate("ahk_id " . msgGui.Hwnd)
+            ; Wait for user to close
+            WinWaitClose("ahk_id " . msgGui.Hwnd)
+        } catch {
+            ; Fallback to regular MsgBox if custom GUI fails
+            MsgBox(msgBoxText, "Target Position Cleared", "OK")
+        }
+    } else {
+        ; Settings window not open, use regular MsgBox
+        MsgBox(msgBoxText, "Target Position Cleared", "OK")
+    }
+
+    LogActivity("Mouse Click Target", "Cleared")
+}
+
 ; Function to handle General Settings window resize
-ResizeGeneralSettings(thresholdEdit, jitterEdit, bufferEdit, guiObj, minMax, width, height) {
+ResizeGeneralSettings(thresholdEdit, jitterEdit, bufferEdit,
+    thresholdLabel1, thresholdLabel2, thresholdDefaultText,
+    jitterLabel1, jitterLabel2, jitterDefaultText,
+    bufferLabel1, bufferLabel2, bufferDefaultText,
+    clickTargetLabel1, clickTargetLabel2, clickTargetText, setTargetBtn, clearTargetBtn,
+    eventsLabel1, eventsLabel2, eventCheckboxes,
+    noteText, saveBtn, cancelBtn, resetBtn, settingsGui,
+    guiObj, minMax, width, height) {
+
     ; Adjust controls when window is resized
     try {
-        thresholdEdit.Move(, , width - 250)
-        jitterEdit.Move(, , width - 250)
-        bufferEdit.Move(, , width - 250)
+        ; Constants for layout
+        marginX := 20
+        editFieldMaxWidth := 250  ; Maximum reasonable width for numeric inputs (prevents absurd stretching)
+        editFieldMinWidth := 150  ; Minimum width for edit fields
+        spacingBetweenEditAndDefault := 10  ; Space between edit field and default text
+        defaultTextWidth := 180  ; Width for default text
+        minWindowWidthForSideBySide := 400  ; Minimum width to show default text next to edit field
+        originalLabelWidth := 400  ; Original label width to maintain text visibility
+
+        ; Adjust available width for controls
+        availableWidth := width - (marginX * 2)
+        ; Determine if we have enough space to show default text next to edit field
+        canShowSideBySide := (width >= minWindowWidthForSideBySide)
+
+        if (canShowSideBySide) {
+            ; Normal layout: edit field and default text side by side
+            ; Calculate edit field width (reasonable size, not too wide)
+            editFieldWidth := Min(editFieldMaxWidth, Max(editFieldMinWidth, availableWidth - defaultTextWidth -
+                spacingBetweenEditAndDefault))
+
+            ; Calculate default text position (next to edit field)
+            defaultTextX := marginX + editFieldWidth + spacingBetweenEditAndDefault
+        } else {
+            ; Narrow window: edit field takes available width, default text below
+            editFieldWidth := Max(editFieldMinWidth, Min(editFieldMaxWidth, availableWidth))
+            defaultTextX := marginX
+        }
+
+        ; Calculate label width (ensure minimum width to prevent text truncation, expand if window is larger)
+        labelWidth := Max(originalLabelWidth, availableWidth)
+
+        ; Update Inactivity Threshold section
+        thresholdLabel1.Move(, , labelWidth)
+        thresholdLabel2.Move(, , labelWidth)
+        thresholdEdit.Move(, , editFieldWidth)
+        if (canShowSideBySide) {
+            thresholdDefaultText.Move(defaultTextX, 57, defaultTextWidth)
+        } else {
+            ; Position default text below edit field when window is narrow
+            thresholdDefaultText.Move(defaultTextX, 80, labelWidth)
+        }
+
+        ; Update Inactivity Jitter section
+        jitterLabel1.Move(, , labelWidth)
+        jitterLabel2.Move(, , labelWidth)
+        jitterEdit.Move(, , editFieldWidth)
+        if (canShowSideBySide) {
+            jitterDefaultText.Move(defaultTextX, 137, defaultTextWidth)
+        } else {
+            ; Position default text below edit field when window is narrow
+            jitterDefaultText.Move(defaultTextX, 160, labelWidth)
+        }
+
+        ; Update Action Buffer Time section
+        bufferLabel1.Move(, , labelWidth)
+        bufferLabel2.Move(, , labelWidth)
+        bufferEdit.Move(, , editFieldWidth)
+        if (canShowSideBySide) {
+            bufferDefaultText.Move(defaultTextX, 217, defaultTextWidth)
+        } else {
+            ; Position default text below edit field when window is narrow
+            bufferDefaultText.Move(defaultTextX, 240, labelWidth)
+        }
+
+        ; Update Mouse Click Target Position section
+        clickTargetLabel1.Move(, , labelWidth)
+        clickTargetLabel2.Move(, , labelWidth)
+        clickTargetText.Move(, , 200)  ; Fixed width for position text
+        if (width >= 450) {
+            setTargetBtn.Move(230, 290, 100, 25)
+            clearTargetBtn.Move(340, 290, 100, 25)
+        } else {
+            setTargetBtn.Move(marginX, 320, 100, 25)
+            clearTargetBtn.Move(marginX + 110, 320, 100, 25)
+        }
+
+        ; Update Enabled Events section
+        eventsLabel1.Move(, , labelWidth)
+        eventsLabel2.Move(, , labelWidth)
+
+        ; Update event checkboxes (2 columns layout)
+        checkboxWidth := 200
+        if (width >= 450) {
+            ; Normal layout: 2 columns
+            eventCheckboxes["MouseMovement"].Move(20, 380, checkboxWidth)
+            eventCheckboxes["ScrollWheel"].Move(20, 405, checkboxWidth)
+            eventCheckboxes["KeyPresses"].Move(20, 430, checkboxWidth)
+            eventCheckboxes["MouseClicks"].Move(240, 380, checkboxWidth)
+            eventCheckboxes["WindowSwitch"].Move(240, 405, checkboxWidth)
+            eventCheckboxes["HardwareAdjust"].Move(240, 430, checkboxWidth)
+        } else {
+            ; Narrow window: single column
+            eventCheckboxes["MouseMovement"].Move(marginX, 380, availableWidth)
+            eventCheckboxes["ScrollWheel"].Move(marginX, 405, availableWidth)
+            eventCheckboxes["KeyPresses"].Move(marginX, 430, availableWidth)
+            eventCheckboxes["MouseClicks"].Move(marginX, 455, availableWidth)
+            eventCheckboxes["WindowSwitch"].Move(marginX, 480, availableWidth)
+            eventCheckboxes["HardwareAdjust"].Move(marginX, 505, availableWidth)
+        }
+
+        ; Update note text (responsive width, maintain minimum for readability)
+        noteText.Move(, , labelWidth)
+
+        ; Update button positions (maintain original relative positions: Reset at x20, Save at x120, Close at x230)
+        ; Original button positions and sizes (exact values from initial creation)
+        originalButtonY := 505
+        originalResetX := 20
+        originalResetWidth := 90
+        originalSaveX := 120
+        originalSaveWidth := 100
+        originalCancelX := 230
+        originalCancelWidth := 100
+        originalButtonHeight := 30
+        originalWindowWidth := 450  ; Original window width
+
+        ; Restore exact original positions when window is at or above original size
+        if (width >= originalWindowWidth) {
+            ; Window is at or above original size - restore exact original positions
+            resetBtn.Move(originalResetX, originalButtonY, originalResetWidth, originalButtonHeight)
+            saveBtn.Move(originalSaveX, originalButtonY, originalSaveWidth, originalButtonHeight)
+            cancelBtn.Move(originalCancelX, originalButtonY, originalCancelWidth, originalButtonHeight)
+        } else {
+            ; Window is narrow - maintain spacing but shift left if needed
+            resetBtnX := marginX
+            saveBtnX := resetBtnX + originalResetWidth + 10
+            cancelBtnX := saveBtnX + originalSaveWidth + 10
+
+            ; Ensure buttons don't overflow window
+            if (cancelBtnX + originalCancelWidth > width - marginX) {
+                ; Scale down button spacing proportionally
+                totalButtonWidth := originalResetWidth + originalSaveWidth + originalCancelWidth
+                availableButtonSpace := width - (marginX * 2)
+                spacing := (availableButtonSpace - totalButtonWidth) / 2
+                saveBtnX := resetBtnX + originalResetWidth + spacing
+                cancelBtnX := saveBtnX + originalSaveWidth + spacing
+            }
+
+            resetBtn.Move(resetBtnX, originalButtonY, originalResetWidth, originalButtonHeight)
+            saveBtn.Move(saveBtnX, originalButtonY, originalSaveWidth, originalButtonHeight)
+            cancelBtn.Move(cancelBtnX, originalButtonY, originalCancelWidth, originalButtonHeight)
+        }
+
     } catch {
         ; Ignore errors during resize
     }
@@ -1702,14 +2770,16 @@ CreateRealtimeMonitor() {
     realtimeMonitorGui.Add("Text", "x10 y35 w400 Center cGray", "Press Ctrl+Alt+M to close")
 
     ; Current activity display (large, prominent)
-    currentActivityCtrl := realtimeMonitorGui.Add("Text", "x10 y60 w400 h40 Center vCurrentActivity", currentActivity)
+    currentActivityCtrl := realtimeMonitorGui.Add("Text", "x10 y60 w400 h40 Center vCurrentActivity",
+        currentActivity)
     currentActivityCtrl.SetFont("s14 Bold")
 
     ; Status info
     realtimeMonitorGui.Add("Text", "x10 y110 w400", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     realtimeMonitorGui.Add("Text", "x10 y130 w200", "Script Status:")
-    realtimeMonitorGui.Add("Text", "x220 y130 w190 vStatusText", pausedByUser ? "PAUSED" : (simulationActive ? "ACTIVE" :
-        "MONITORING"))
+    realtimeMonitorGui.Add("Text", "x220 y130 w190 vStatusText", pausedByUser ? "PAUSED" : (simulationActive ?
+        "ACTIVE" :
+            "MONITORING"))
 
     realtimeMonitorGui.Add("Text", "x10 y155 w200", "Current Action:")
     realtimeMonitorGui.Add("Text", "x220 y155 w190 vActionText", currentActivity)
@@ -1903,6 +2973,9 @@ UpdateTrayToggleMenu() {
 ; ============================================
 ; INITIALIZATION
 ; ============================================
+; Load event settings from INI file
+LoadEventSettings()
+
 ; Initialize last input time
 lastInputTime := A_TickCount
 lastKnownInputTime := GetLastInputInfo()
