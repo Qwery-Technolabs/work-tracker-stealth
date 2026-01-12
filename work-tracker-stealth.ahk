@@ -48,6 +48,19 @@ serviceCheckEnabled := false  ; Whether to check services
 ; Mouse click target position (0 = not set, otherwise {x: X, y: Y})
 mouseClickTargetPos := 0  ; Target position for multiple left-clicks
 
+; Mouse behavior tuning (runtime-only)
+mouseMovementMaxIntervalSec := 10.0  ; Random mouse-move will happen within 0.1s..this max (when enabled)
+scrollAllowUp := true
+scrollAllowDown := true
+mouseClicksMaxPerMinute := 60  ; Randomized 1..this per minute (cap 300). Applies when target is set.
+
+; Click scheduler state (internal)
+clickWindowStartTick := 0
+clicksThisWindowLimit := 0
+clicksThisWindowDone := 0
+nextTargetClickAt := 0
+clickSchedulerRunning := false
+
 ; Event enable/disable states (all enabled by default)
 eventEnabled := Map(
     "MouseMovement", true,
@@ -55,6 +68,7 @@ eventEnabled := Map(
     "KeyPresses", true,
     "MouseClicks", true,
     "WindowSwitch", true,
+    "TabSwitch", true,
     "HardwareAdjust", true
 )
 
@@ -89,6 +103,17 @@ LogActivity(activityType, details := "") {
 ; They also won't type characters or modify content in documents/code
 keyList := ['Ctrl', 'Alt', 'Shift', 'LControl', 'RControl', 'LAlt', 'RAlt', 'LShift', 'RShift']
 lastKey := ""  ; For Markov chain to avoid patterns
+
+; Keyboard event: which key actions are allowed for randomization (no INI; runtime-only)
+; Note: Tab/Esc/Ctrl+Tab can affect focused apps; you can disable them anytime in Event Settings → Keyboard.
+keyPressActions := Map(
+    "Shift", true,
+    "Ctrl",  true,
+    "Alt",   true,
+    "Tab",   true,
+    "Esc",   true,
+    "ScrollLock", true
+)
 
 ; Random mouse movement - no patterns, completely random across screen
 
@@ -238,6 +263,7 @@ CheckInactivity() {
             ; Random initial delay before first action (5-15 seconds)
             initialDelay := Random(5000, 15000)
             SetTimer(SimulateHuman, initialDelay)
+            EnsureClickSchedulerRunning()
             LogActivity("Simulation", "Started - Inactivity detected (" . Round(timeSinceInput / 1000) . "s)")
             UpdateTrayIcon()  ; Update to red X icon when active
         }
@@ -272,6 +298,7 @@ CheckUserInput() {
         if (simulationActive) {
             simulationActive := false
             SetTimer(SimulateHuman, 0)
+            StopClickScheduler()
             LogActivity("Service Check", "Paused - Service is running")
             UpdateTrayIcon()
         }
@@ -307,6 +334,7 @@ CheckUserInput() {
                 UpdateTrayIcon()  ; Update icon immediately
                 currentActivity := "⏸️ PAUSED - Real user activity detected"
                 SetTimer(SimulateHuman, 0)
+                StopClickScheduler()
                 LogActivity("Simulation", "Paused - Real user activity detected (immediate)")
                 lastKnownInputTime := currentInputTime
                 lastInputTime := currentTime
@@ -351,6 +379,7 @@ CheckUserInput() {
                     simulationActive := false
                     currentActivity := "⏸️ PAUSED - Real user activity detected"
                     SetTimer(SimulateHuman, 0)  ; Stop all scheduled simulation actions
+                    StopClickScheduler()
                     LogActivity("Simulation", "Paused - Real user activity detected")
                     UpdateTrayIcon()  ; Ensure icon is updated (already done above, but ensure state is correct)
                 }
@@ -871,10 +900,16 @@ PerformScrollAfterMouseMove() {
 
 ; Standalone scroll wheel function for random actions (30% ratio)
 PerformScrollWheel() {
-    global simulationActive, pausedByUser
+    global simulationActive, pausedByUser, scrollAllowUp, scrollAllowDown
 
     ; Don't scroll if simulation is paused or not active
     if (!simulationActive || pausedByUser) {
+        return
+    }
+
+    ; If both directions disabled, do nothing
+    if (!scrollAllowUp && !scrollAllowDown) {
+        LogActivity("Scroll Wheel", "Skipped (both directions disabled)")
         return
     }
 
@@ -882,8 +917,14 @@ PerformScrollWheel() {
     MouseGetPos(&currentX, &currentY)
 
     ; Always scroll - if there's overflowing content, it will scroll; if not, nothing happens
-    ; Random scroll direction: 50% up, 50% down
-    scrollDirection := Random(1, 2) == 1 ? "WheelUp" : "WheelDown"
+    ; Scroll direction depends on settings
+    if (scrollAllowUp && scrollAllowDown) {
+        scrollDirection := Random(1, 2) == 1 ? "WheelUp" : "WheelDown"
+    } else if (scrollAllowUp) {
+        scrollDirection := "WheelUp"
+    } else {
+        scrollDirection := "WheelDown"
+    }
 
     ; Random scroll amount (4-19 clicks) - more than 3, less than 20
     scrollAmount := Random(4, 19)
@@ -939,6 +980,131 @@ ClampPointToMonitor(x, y, &outX, &outY, padding := 0) {
     GetMonitorRectFromPoint(x, y, &l, &t, &r, &b, &monIdx)
     outX := Min(Max(x, l + padding), r - padding)
     outY := Min(Max(y, t + padding), b - padding)
+}
+
+GetRandomizedClickPoint(baseX, baseY, rangePx, &outX, &outY) {
+    ; Randomize within a square (±rangePx), with edge-aware direction bias.
+    GetMonitorRectFromPoint(baseX, baseY, &l, &t, &r, &b, &monIdx)
+
+    if (baseX <= l + rangePx) {
+        dx := Random(0, rangePx)
+    } else if (baseX >= r - rangePx) {
+        dx := Random(-rangePx, 0)
+    } else {
+        dx := Random(-rangePx, rangePx)
+    }
+
+    if (baseY <= t + rangePx) {
+        dy := Random(0, rangePx)
+    } else if (baseY >= b - rangePx) {
+        dy := Random(-rangePx, 0)
+    } else {
+        dy := Random(-rangePx, rangePx)
+    }
+
+    outX := baseX + dx
+    outY := baseY + dy
+    ClampPointToMonitor(outX, outY, &outX, &outY, 0)
+}
+
+ShowClickTargetPreviewSquare(baseX, baseY, rangePx := 5, ms := 1500) {
+    ; Draw a small 10x10 square (±5px) as a click-through overlay.
+    try {
+        x := baseX - rangePx
+        y := baseY - rangePx
+        w := rangePx * 2
+        h := rangePx * 2
+
+        g := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x20", "ClickTargetPreview")
+        g.BackColor := "FFFFFF"
+        g.Add("Text", "x0 y0 w" . w . " h" . h . " Border", "")
+        g.Show("x" . x . " y" . y . " w" . w . " h" . h . " NA")
+        WinSetTransparent(180, "ahk_id " . g.Hwnd)
+        SetTimer((*) => (g.Destroy()), -ms)
+    } catch {
+        ; ignore overlay failures
+    }
+}
+
+UpdateClickSchedulerState() {
+    global clickWindowStartTick, clicksThisWindowLimit, clicksThisWindowDone, nextTargetClickAt
+    global mouseClicksMaxPerMinute
+
+    now := A_TickCount
+    if (clickWindowStartTick == 0 || now - clickWindowStartTick >= 60000) {
+        clickWindowStartTick := now
+        maxVal := Min(300, Max(1, mouseClicksMaxPerMinute))
+        clicksThisWindowLimit := Random(1, maxVal)
+        clicksThisWindowDone := 0
+        nextTargetClickAt := 0
+    }
+
+    if (nextTargetClickAt == 0 && clicksThisWindowDone < clicksThisWindowLimit) {
+        remainingMs := (clickWindowStartTick + 60000) - now
+        remainingClicks := clicksThisWindowLimit - clicksThisWindowDone
+        if (remainingMs < 200) {
+            remainingMs := 200
+        }
+        avg := remainingMs / Max(1, remainingClicks)
+        delay := Round(Random(Max(100, avg * 0.4), Max(150, avg * 1.4)))
+        nextTargetClickAt := now + delay
+    }
+}
+
+MouseClickSchedulerTick(*) {
+    global simulationActive, pausedByUser, eventEnabled, mouseClickTargetPos
+    global clicksThisWindowDone, clicksThisWindowLimit, nextTargetClickAt
+
+    if (!simulationActive || pausedByUser) {
+        return
+    }
+    if (!eventEnabled["MouseClicks"]) {
+        return
+    }
+    if (mouseClickTargetPos == 0 || !mouseClickTargetPos.HasProp("x") || !mouseClickTargetPos.HasProp("y")) {
+        return
+    }
+
+    UpdateClickSchedulerState()
+
+    now := A_TickCount
+    if (clicksThisWindowDone >= clicksThisWindowLimit) {
+        return
+    }
+    if (nextTargetClickAt == 0 || now < nextTargetClickAt) {
+        return
+    }
+
+    baseX := mouseClickTargetPos.x
+    baseY := mouseClickTargetPos.y
+    GetRandomizedClickPoint(baseX, baseY, 5, &cx, &cy)
+
+    try {
+        MouseMove(cx, cy, 0)
+        Click()
+        clicksThisWindowDone += 1
+        nextTargetClickAt := 0
+        UpdateClickSchedulerState()
+        LogActivity("Mouse Click", "Target click (" . clicksThisWindowDone . "/" . clicksThisWindowLimit . ") at (" . cx . "," . cy . ")")
+    } catch {
+        ; ignore click failures
+    }
+}
+
+EnsureClickSchedulerRunning() {
+    global clickSchedulerRunning
+    if (!clickSchedulerRunning) {
+        clickSchedulerRunning := true
+        SetTimer(MouseClickSchedulerTick, 100)
+    }
+}
+
+StopClickScheduler() {
+    global clickSchedulerRunning
+    if (clickSchedulerRunning) {
+        SetTimer(MouseClickSchedulerTick, 0)
+        clickSchedulerRunning := false
+    }
 }
 
 ShowAlwaysOnTopMessageForWindow(ownerWinTitle, message, title) {
@@ -1076,6 +1242,7 @@ PickMouseClickTargetPosition(sourceLabel := "", ownerWinTitle := "") {
             ToolTip()
             UpdateSettingsWindowTargetPosition()
             LogActivity("Mouse Click Target", "Set to (" . finalX . ", " . finalY . ")" . (sourceLabel != "" ? " - " . sourceLabel : ""))
+            ShowClickTargetPreviewSquare(finalX, finalY, 5, 2000)
             ; If ownerWinTitle is provided, treat it as owner for stacking; otherwise show standalone.
             ownerHwnd := 0
             if (ownerWinTitle != "") {
@@ -1098,6 +1265,13 @@ PerformMouseClicks() {
 
     ; Don't click if simulation is paused or not active
     if (!simulationActive || pausedByUser) {
+        return
+    }
+
+    ; New behavior: target clicks are handled by scheduler (max per minute + jitter).
+    ; If a target is set and MouseClicks is enabled, ensure scheduler is running and return.
+    if (mouseClickTargetPos != 0 && mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y")) {
+        EnsureClickSchedulerRunning()
         return
     }
 
@@ -1241,49 +1415,86 @@ PerformWindowSwitch() {
 }
 
 ; ============================================
+; TAB SWITCHING (CTRL+TAB)
+; ============================================
+PerformTabSwitch() {
+    global currentActivity
+    ; Simulate Ctrl+Tab tab switching (browser/editor style)
+    tabCount := Random(1, 3)
+    currentActivity := "🗂️ Tab Switch - Ctrl+Tab (" . tabCount . " tabs)"
+
+    Send("{Ctrl down}")
+    Sleep(Random(50, 100))
+    loop tabCount {
+        Send("{Tab}")
+        Sleep(Random(80, 160))
+    }
+    Send("{Ctrl up}")
+
+    LogActivity("Tab Switch", tabCount . " tabs (Ctrl+Tab)")
+}
+
+; ============================================
 ; RANDOM KEY PRESSES
 ; ============================================
 PerformKeyPresses() {
-    global keyList, lastKey, currentActivity
+    global keyList, lastKey, currentActivity, keyPressActions
+
+    ; Build allowed actions from settings
+    actions := []
+    for name, enabled in keyPressActions {
+        if (enabled) {
+            actions.Push(name)
+        }
+    }
+    ; Fallback to safe modifiers if user disabled everything
+    if (actions.Length == 0) {
+        actions := ["Shift", "Ctrl", "Alt"]
+    }
 
     ; Random sequence length (2-5 presses)
     seqLen := Random(2, 5)
-    currentActivity := "⌨️ Key Press - Sending " . seqLen . " modifier keys"
+    currentActivity := "⌨️ Key Press - Sending " . seqLen . " key actions"
 
     loop seqLen {
-        ; Markov chain: avoid adjacent keys
+        ; Markov chain: avoid adjacent repeats
         if (lastKey != "" && Random(1, 10) <= 7) {
-            ; Bias towards non-adjacent keys
-            filteredKeys := []
-            for key in keyList {
-                if (key != lastKey) {
-                    filteredKeys.Push(key)
+            filtered := []
+            for a in actions {
+                if (a != lastKey) {
+                    filtered.Push(a)
                 }
             }
-            if (filteredKeys.Length > 0) {
-                key := filteredKeys[Random(1, filteredKeys.Length)]
-            } else {
-                key := keyList[Random(1, keyList.Length)]
-            }
+            action := (filtered.Length > 0) ? filtered[Random(1, filtered.Length)] : actions[Random(1, actions.Length)]
         } else {
-            key := keyList[Random(1, keyList.Length)]
+            action := actions[Random(1, actions.Length)]
         }
 
-        lastKey := key
+        lastKey := action
 
-        ; Send modifier key (Ctrl, Alt, Shift) - completely safe, does nothing when pressed alone
-        ; These keys won't trigger laptop hardware functions (brightness, volume, etc.)
-        ; They also won't type characters or modify content in documents/code
-        if (Random(1, 10) == 1) {
-            ; 10% chance for key hold (simulates natural key press)
-            Send("{" . key . " down}")
-            Sleep(Random(200, 500))
-            Send("{" . key . " up}")
+        if (action == "Tab") {
+            Send("{Tab}")
+        } else if (action == "Esc") {
+            Send("{Esc}")
+        } else if (action == "ScrollLock") {
+            ; Press once, sometimes twice for natural variation
+            Send("{ScrollLock}")
+            if (Random(1, 4) == 1) {
+                Sleep(Random(80, 160))
+                Send("{ScrollLock}")
+            }
         } else {
-            ; Normal modifier key press (press and release quickly)
-            Send("{" . key . " down}")
-            Sleep(Random(50, 150))  ; Short hold for modifier keys
-            Send("{" . key . " up}")
+            ; Modifier key press (Ctrl/Alt/Shift) - safe when pressed alone
+            key := action
+            if (Random(1, 10) == 1) {
+                Send("{" . key . " down}")
+                Sleep(Random(200, 500))
+                Send("{" . key . " up}")
+            } else {
+                Send("{" . key . " down}")
+                Sleep(Random(50, 150))
+                Send("{" . key . " up}")
+            }
         }
 
         ; Random delay between keys (100-300ms)
@@ -1296,18 +1507,8 @@ PerformKeyPresses() {
         }
     }
 
-    ; Add Scroll Lock key press (2 times) - safe key that doesn't interfere with work
-    ; 30% chance to press Scroll Lock after modifier keys
-    if (Random(1, 10) <= 3) {
-        ; Press Scroll Lock twice with natural delay
-        Send("{ScrollLock}")
-        Sleep(Random(100, 200))  ; Natural delay between presses
-        Send("{ScrollLock}")
-        LogActivity("Key Press", "Scroll Lock pressed 2 times")
-    }
-
     ; Log activity after sequence completes
-    LogActivity("Key Press", seqLen . " modifier keys")
+    LogActivity("Key Press", seqLen . " key actions")
 }
 
 ; ============================================
@@ -1316,9 +1517,27 @@ PerformKeyPresses() {
 SimulateHuman() {
     global simulationActive, pausedByUser, scriptActionInProgress
     global scriptActionStartTime, scriptActionEndTime, eventEnabled
+    global mouseMovementMaxIntervalSec, scrollAllowUp, scrollAllowDown
+    global nextMouseMoveDueTick
 
     if (!simulationActive || pausedByUser) {
         return
+    }
+
+    ; Enforce maximum interval for mouse movement (random delay <= max, min 0.1s)
+    if (!IsSet(nextMouseMoveDueTick)) {
+        nextMouseMoveDueTick := 0
+    }
+    forceMouseMove := false
+    if (eventEnabled["MouseMovement"]) {
+        maxMs := Max(100, Round(mouseMovementMaxIntervalSec * 1000))
+        if (nextMouseMoveDueTick == 0) {
+            nextMouseMoveDueTick := A_TickCount + Random(100, maxMs)
+        } else if (A_TickCount >= nextMouseMoveDueTick) {
+            forceMouseMove := true
+        }
+    } else {
+        nextMouseMoveDueTick := 0
     }
 
     ; Mark script action start time (for distinguishing script vs human input)
@@ -1328,12 +1547,12 @@ SimulateHuman() {
     scriptActionInProgress := true
 
     ; Build list of enabled events with their weight ranges
-    ; Original distribution: 25% mouse, 25% scroll, 20% keys, 15% mouse clicks, 10% window switch, 5% hardware
+    ; Distribution: 25% mouse, 25% scroll, 20% keys, 15% mouse clicks, 8% window switch, 2% tab switch, 5% hardware
     enabledEvents := []
     if (eventEnabled["MouseMovement"]) {
         enabledEvents.Push({ name: "MouseMovement", min: 1, max: 25 })
     }
-    if (eventEnabled["ScrollWheel"]) {
+    if (eventEnabled["ScrollWheel"] && (scrollAllowUp || scrollAllowDown)) {
         enabledEvents.Push({ name: "ScrollWheel", min: 26, max: 50 })
     }
     if (eventEnabled["KeyPresses"]) {
@@ -1343,7 +1562,10 @@ SimulateHuman() {
         enabledEvents.Push({ name: "MouseClicks", min: 71, max: 85 })
     }
     if (eventEnabled["WindowSwitch"]) {
-        enabledEvents.Push({ name: "WindowSwitch", min: 86, max: 95 })
+        enabledEvents.Push({ name: "WindowSwitch", min: 86, max: 93 })
+    }
+    if (eventEnabled["TabSwitch"]) {
+        enabledEvents.Push({ name: "TabSwitch", min: 94, max: 95 })
     }
     if (eventEnabled["HardwareAdjust"]) {
         enabledEvents.Push({ name: "HardwareAdjust", min: 96, max: 100 })
@@ -1356,6 +1578,10 @@ SimulateHuman() {
         return
     }
 
+    if (forceMouseMove) {
+        selectedEvent := "MouseMovement"
+        randAction := 1  ; treat as mouse movement for timing logic below
+    } else {
     ; Calculate total weight and select from enabled events
     totalWeight := 0
     for event in enabledEvents {
@@ -1378,6 +1604,7 @@ SimulateHuman() {
         }
         cumulativeWeight += eventWeight
     }
+    }
 
     ; Log simulation start
     LogActivity("Simulation", "Action triggered")
@@ -1388,6 +1615,13 @@ SimulateHuman() {
         currentActivity := "🖱️ Mouse Movement - Random paths & oval shapes"
         PerformMouseMovement()
         currentActivity := "✅ Mouse Movement Complete (scroll scheduled in 10s)"
+        ; schedule next due mouse move
+        if (eventEnabled["MouseMovement"]) {
+            maxMs := Max(100, Round(mouseMovementMaxIntervalSec * 1000))
+            nextMouseMoveDueTick := A_TickCount + Random(100, maxMs)
+        } else {
+            nextMouseMoveDueTick := 0
+        }
     } else if (selectedEvent == "ScrollWheel") {
         ; Scroll wheel (25%) - standalone scroll action
         currentActivity := "🖱️ Mouse Scroll - Random scroll up/down"
@@ -1408,6 +1642,11 @@ SimulateHuman() {
         currentActivity := "🪟 Window Switch - Switching between windows (Alt+Tab)"
         PerformWindowSwitch()
         currentActivity := "✅ Window Switch Complete"
+    } else if (selectedEvent == "TabSwitch") {
+        ; Tab switching with Ctrl+Tab
+        currentActivity := "🗂️ Tab Switch - Switching tabs (Ctrl+Tab)"
+        PerformTabSwitch()
+        currentActivity := "✅ Tab Switch Complete"
     } else if (selectedEvent == "HardwareAdjust") {
         ; Hardware adjustment - brightness/volume (5% - natural laptop usage)
         currentActivity := "⚙️ Hardware Adjust - Adjusting brightness/volume"
@@ -1432,7 +1671,7 @@ SimulateHuman() {
         ; Mouse clicks - takes 1-3 seconds, clear after 3.5 seconds
         SetTimer(ClearScriptActionFlag, -3500)
     } else if (randAction <= 95) {
-        ; Window switch - takes a few seconds, clear after 3 seconds
+        ; Window/tab switch - takes a few seconds, clear after 3 seconds
         SetTimer(ClearScriptActionFlag, -3000)
     } else {
         ; Hardware adjust - quick, clear after 200ms
@@ -1454,7 +1693,7 @@ SimulateHuman() {
         ; Mouse clicks - every 5-10 seconds
         nextDelay := Random(5000, 10000)
     } else if (randAction <= 95) {
-        ; Window switch - every 5-10 seconds (reduced, more frequent)
+        ; Window/tab switch - every 5-10 seconds
         nextDelay := Random(5000, 10000)
     } else {
         ; Hardware adjust - every 5-10 seconds (reduced)
@@ -1622,11 +1861,13 @@ TogglePauseState(trigger := "User") {
     if (pausedByUser) {
         simulationActive := false
         SetTimer(SimulateHuman, 0)
+        StopClickScheduler()
         currentActivity := "⏸️ PAUSED - Manual toggle active"
         LogActivity(trigger, "Paused simulation")
     } else {
         currentActivity := "⏳ Idle - Monitoring for inactivity (10s threshold)"
         LogActivity(trigger, "Resumed simulation")
+        EnsureClickSchedulerRunning()
     }
 
     UpdateTrayIcon()
@@ -1637,6 +1878,161 @@ TogglePauseState(trigger := "User") {
 ; ============================================
 ; Global variable to track scheduled quit time (0 = not scheduled)
 scheduledQuitTime := 0
+
+FormatRemainingTime(ms) {
+    if (ms < 0) {
+        ms := 0
+    }
+    totalSeconds := Floor(ms / 1000)
+    hours := Floor(totalSeconds / 3600)
+    minutes := Floor((totalSeconds - (hours * 3600)) / 60)
+    seconds := Mod(totalSeconds, 60)
+    return hours . "h " . minutes . "m " . seconds . "s"
+}
+
+ParseAutoQuitInput(inputValue, &totalMilliseconds, &timeDisplay) {
+    inputValue := Trim(inputValue)
+    if (inputValue == "") {
+        return false
+    }
+
+    if InStr(inputValue, ":") {
+        parts := StrSplit(inputValue, ":")
+        if (parts.Length != 2) {
+            return false
+        }
+        hours := Integer(parts[1])
+        minutes := Integer(parts[2])
+        if (hours < 0 || hours > 24) {
+            return false
+        }
+        if (minutes < 0 || minutes > 59) {
+            return false
+        }
+        if (hours == 24 && minutes > 0) {
+            return false
+        }
+        if (hours == 0 && minutes == 0) {
+            return false
+        }
+
+        totalMilliseconds := (hours * 3600 + minutes * 60) * 1000
+        timeDisplay := hours . ":" . Format("{:02}", minutes)
+        return true
+    } else {
+        hours := Integer(inputValue)
+        if (hours < 1 || hours > 24) {
+            return false
+        }
+        totalMilliseconds := (hours * 3600) * 1000
+        timeDisplay := hours . " hour(s)"
+        return true
+    }
+}
+
+ShowAutoQuitSettings() {
+    global scheduledQuitTime
+
+    autoQuitGui := Gui("+AlwaysOnTop -Resize", "Auto-Quit Settings")
+    autoQuitGui.SetFont("s10", "Segoe UI")
+
+    autoQuitGui.Add("Text", "x20 y15 w440", "Auto-Quit Settings")
+    autoQuitGui.Add("Text", "x20 y35 w440 cGray", "Schedule the script to quit automatically after a delay.")
+
+    tab := autoQuitGui.Add("Tab3", "x20 y60 w440 h240", ["Schedule", "Status"])
+
+    ; ----------------------------
+    ; Schedule tab
+    ; ----------------------------
+    tab.UseTab(1)
+    autoQuitGui.Add("Text", "x40 y100 w390", "Enter time before auto-quit:")
+    autoQuitGui.Add("Text", "x40 y118 w390 cGray", "Format: HH:MM (e.g., 2:30) or hours only (e.g., 3). Max 24:00.")
+    inputEdit := autoQuitGui.Add("Edit", "x40 y145 w160", "2:30")
+
+    scheduleBtn := autoQuitGui.Add("Button", "x210 y143 w110 h28 Default", "Schedule")
+    cancelBtn2 := autoQuitGui.Add("Button", "x325 y143 w90 h28", "Cancel")
+
+    statusLine := autoQuitGui.Add("Text", "x40 y185 w390 cGray", "")
+
+    ; ----------------------------
+    ; Status tab
+    ; ----------------------------
+    tab.UseTab(2)
+    statusHeader := autoQuitGui.Add("Text", "x40 y110 w390", "Current status:")
+    statusText := autoQuitGui.Add("Text", "x40 y135 w390 cGray", "")
+
+    refreshFn := RefreshAutoQuitStatus.Bind(autoQuitGui, statusLine, statusText)
+    refreshFn()
+    SetTimer(refreshFn, 500)
+    autoQuitGui.OnEvent("Close", (*) => SetTimer(refreshFn, 0))
+
+    tab.UseTab()
+
+    closeBtn := autoQuitGui.Add("Button", "x360 y315 w100 h30", "Close")
+    closeBtn.OnEvent("Click", (*) => (SetTimer(refreshFn, 0), autoQuitGui.Destroy()))
+
+    scheduleBtn.OnEvent("Click", AutoQuitScheduleClick.Bind(autoQuitGui, inputEdit, statusLine, statusText, refreshFn))
+    cancelBtn2.OnEvent("Click", AutoQuitCancelClick.Bind(autoQuitGui, statusLine, statusText, refreshFn))
+
+    autoQuitGui.Show("w480 h360")
+}
+
+RefreshAutoQuitStatus(ownerGui, statusLineCtrl, statusTextCtrl, *) {
+    global scheduledQuitTime
+    if (!IsObject(statusLineCtrl) || !IsObject(statusTextCtrl)) {
+        return
+    }
+    if (scheduledQuitTime == 0) {
+        statusLineCtrl.Text := "Status: Not scheduled"
+        statusTextCtrl.Text := "Auto-quit is not scheduled."
+    } else {
+        remaining := scheduledQuitTime - A_TickCount
+        statusLineCtrl.Text := "Status: Scheduled (" . FormatRemainingTime(remaining) . " remaining)"
+        statusTextCtrl.Text := "Auto-quit is scheduled.`nTime remaining: " . FormatRemainingTime(remaining) . "`n`nPress Cancel to stop it."
+    }
+}
+
+AutoQuitScheduleClick(ownerGui, inputEdit, statusLineCtrl, statusTextCtrl, refreshFn, *) {
+    TryScheduleAutoQuit(ownerGui, inputEdit)
+    refreshFn()
+}
+
+AutoQuitCancelClick(ownerGui, statusLineCtrl, statusTextCtrl, refreshFn, *) {
+    TryCancelAutoQuit(ownerGui)
+    refreshFn()
+}
+
+TryScheduleAutoQuit(ownerGui, inputEdit) {
+    global scheduledQuitTime
+
+    inputValue := inputEdit.Value
+    ok := ParseAutoQuitInput(inputValue, &totalMilliseconds, &timeDisplay)
+    if (!ok) {
+        ShowOwnedPopup(ownerGui.Hwnd, "Invalid time format.`n`nUse HH:MM (e.g., 2:30) or hours only (e.g., 3).", "Invalid Format")
+        return false
+    }
+
+    scheduledQuitTime := A_TickCount + totalMilliseconds
+    SetTimer(CheckScheduledQuit, 60000)
+    LogActivity("Scheduled Quit", "Scheduled: " . timeDisplay)
+
+    remaining := scheduledQuitTime - A_TickCount
+    ShowOwnedPopup(ownerGui.Hwnd, "Auto-quit scheduled!`n`nAfter: " . timeDisplay . "`nTime remaining: " . FormatRemainingTime(remaining), "Scheduled Auto-Quit")
+    return true
+}
+
+TryCancelAutoQuit(ownerGui) {
+    global scheduledQuitTime
+    if (scheduledQuitTime == 0) {
+        ShowOwnedPopup(ownerGui.Hwnd, "Auto-quit is not scheduled.", "Nothing to Cancel")
+        return false
+    }
+    scheduledQuitTime := 0
+    SetTimer(CheckScheduledQuit, 0)
+    LogActivity("Scheduled Quit", "Cancelled")
+    ShowOwnedPopup(ownerGui.Hwnd, "Scheduled auto-quit has been cancelled.", "Cancelled")
+    return true
+}
 
 ; ============================================
 ; NEW FEATURE: GENERAL SETTINGS
@@ -1652,6 +2048,7 @@ LoadEventSettings() {
         "KeyPresses", true,
         "MouseClicks", true,
         "WindowSwitch", true,
+        "TabSwitch", true,
         "HardwareAdjust", true
     )
 
@@ -1668,6 +2065,8 @@ SaveEventSettings() {
 ; Function to show event settings dialog
 ShowEventSettings() {
     global eventEnabled, mouseClickTargetPos
+    global mouseMovementMaxIntervalSec, scrollAllowUp, scrollAllowDown, mouseClicksMaxPerMinute
+    global keyPressActions
     
     ; Create GUI for event settings
     eventGui := Gui("+AlwaysOnTop -Resize", "Event Settings")
@@ -1679,7 +2078,8 @@ ShowEventSettings() {
         "Enable/disable simulation events. Settings apply immediately.")
     
     ; Tab control (group events by device type)
-    tab := eventGui.Add("Tab3", "x20 y60 w430 h270", ["Mouse", "Keyboard", "Other"])
+    ; Wider + taller to avoid clipping/overlap with mouse advanced options
+    tab := eventGui.Add("Tab3", "x20 y60 w520 h430", ["Mouse", "Keyboard", "Other"])
     
     eventCheckboxes := Map()
     
@@ -1687,36 +2087,164 @@ ShowEventSettings() {
     ; Mouse tab
     ; ----------------------------
     tab.UseTab(1)
-    eventCheckboxes["MouseMovement"] := eventGui.Add("Checkbox", "x40 y100 w250", "Mouse Movement")
-    eventCheckboxes["ScrollWheel"] := eventGui.Add("Checkbox", "x40 y125 w250", "Scroll Wheel")
-    eventCheckboxes["MouseClicks"] := eventGui.Add("Checkbox", "x40 y150 w250", "Mouse Clicks")
-    
-    ; Mouse Click Target Position (mouse-only setting)
-    clickTargetLabel1 := eventGui.Add("Text", "x40 y185 w380", "Mouse Click Target Position:")
-    clickTargetLabel2 := eventGui.Add("Text", "x40 y200 w380 cGray",
-        "Used for multiple left-click actions (optional)")
-    if (mouseClickTargetPos != 0 && mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y")) {
-        clickTargetText := eventGui.Add("Text", "x40 y223 w200", "Position: (" . mouseClickTargetPos.x . ", " .
-            mouseClickTargetPos.y . ")")
-        setTargetBtn := eventGui.Add("Button", "x250 y218 w90 h25", "Set Target")
-        clearTargetBtn := eventGui.Add("Button", "x345 y218 w90 h25", "Clear")
-    } else {
-        clickTargetText := eventGui.Add("Text", "x40 y223 w200 cGray", "No target position set")
-        setTargetBtn := eventGui.Add("Button", "x250 y218 w90 h25", "Set Target")
-        clearTargetBtn := eventGui.Add("Button", "x345 y218 w90 h25 Disabled", "Clear")
-    }
+    ; Indented layout (options under each event) + hide/collapse sub-options when unticked
+    baseX := 40
+    indentX := 65
+
+    eventCheckboxes["MouseMovement"] := eventGui.Add("Checkbox", "x0 y0 w250", "Mouse Movement")
+    moveLbl := eventGui.Add("Text", "x0 y0 w240 cGray", "Max interval (sec) (min 0.1):")
+    mouseMoveMaxEdit := eventGui.Add("Edit", "x0 y0 w70", mouseMovementMaxIntervalSec)
+    moveHelp := eventGui.Add("Text", "x0 y0 w440 cGray", "Mouse movement happens randomly within ≤ max seconds.")
+
+    eventCheckboxes["ScrollWheel"] := eventGui.Add("Checkbox", "x0 y0 w250", "Scroll Wheel")
+    scrollUpChk := eventGui.Add("Checkbox", "x0 y0 w120", "Allow Up")
+    scrollDownChk := eventGui.Add("Checkbox", "x0 y0 w140", "Allow Down")
+    scrollUpChk.Value := scrollAllowUp ? 1 : 0
+    scrollDownChk.Value := scrollAllowDown ? 1 : 0
+
+    eventCheckboxes["MouseClicks"] := eventGui.Add("Checkbox", "x0 y0 w250", "Mouse Clicks")
+    clicksLbl := eventGui.Add("Text", "x0 y0 w260 cGray", "Max clicks / minute (1-300):")
+    clicksPerMinEdit := eventGui.Add("Edit", "x0 y0 w70", mouseClicksMaxPerMinute)
+    clicksHelp := eventGui.Add("Text", "x0 y0 w440 cGray", "Actual clicks per minute are randomized: 1..max.")
+
+    clickTargetLabel1 := eventGui.Add("Text", "x0 y0 w420", "Mouse Click Target Position:")
+    clickTargetLabel2 := eventGui.Add("Text", "x0 y0 w520 cGray", "Clicks will jitter within a 10×10 px box around the target (±5px)")
+    clickTargetText := eventGui.Add("Text", "x0 y0 w300 cGray", "No target position set")
+    setTargetBtn := eventGui.Add("Button", "x0 y0 w90 h25", "Set Target")
+    clearTargetBtn := eventGui.Add("Button", "x0 y0 w70 h25 Disabled", "Clear")
+
+    ApplyMouseTabAccordionLayout := (*) => (
+        y := 95,
+        gapBlock := 12,
+        rowGap := 26,
+
+        ; Mouse Movement
+        eventCheckboxes["MouseMovement"].Move(baseX, y),
+        y += 28,
+        (eventCheckboxes["MouseMovement"].Value == 1)
+            ? (
+                moveLbl.Visible := true, mouseMoveMaxEdit.Visible := true, moveHelp.Visible := true,
+                moveLbl.Move(indentX, y),
+                mouseMoveMaxEdit.Move(indentX + 210, y - 3),
+                y += rowGap,
+                moveHelp.Move(indentX, y),
+                y += gapBlock + 18
+            )
+            : (moveLbl.Visible := false, mouseMoveMaxEdit.Visible := false, moveHelp.Visible := false, y += gapBlock),
+
+        ; Scroll Wheel
+        eventCheckboxes["ScrollWheel"].Move(baseX, y),
+        y += 28,
+        (eventCheckboxes["ScrollWheel"].Value == 1)
+            ? (
+                scrollUpChk.Visible := true, scrollDownChk.Visible := true,
+                scrollUpChk.Move(indentX, y),
+                scrollDownChk.Move(indentX + 130, y),
+                y += gapBlock + 22
+            )
+            : (scrollUpChk.Visible := false, scrollDownChk.Visible := false, y += gapBlock),
+
+        ; Mouse Clicks
+        eventCheckboxes["MouseClicks"].Move(baseX, y),
+        y += 28,
+        (eventCheckboxes["MouseClicks"].Value == 1)
+            ? (
+                clicksLbl.Visible := true, clicksPerMinEdit.Visible := true, clicksHelp.Visible := true,
+                clicksLbl.Move(indentX, y),
+                clicksPerMinEdit.Move(indentX + 210, y - 3),
+                y += rowGap,
+                clicksHelp.Move(indentX, y),
+                y += gapBlock + 22,
+
+                clickTargetLabel1.Visible := true, clickTargetLabel2.Visible := true,
+                clickTargetText.Visible := true, setTargetBtn.Visible := true, clearTargetBtn.Visible := true,
+                ; Indent target-position block under Mouse Clicks
+                clickTargetLabel1.Move(indentX, y),
+                y += 18,
+                clickTargetLabel2.Move(indentX, y),
+                y += 22,
+                (mouseClickTargetPos != 0 && mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y"))
+                    ? (clickTargetText.Text := "Position: (" . mouseClickTargetPos.x . ", " . mouseClickTargetPos.y . ")", clickTargetText.SetFont("cBlack"), clearTargetBtn.Enabled := true)
+                    : (clickTargetText.Text := "No target position set", clickTargetText.SetFont("cGray"), clearTargetBtn.Enabled := false),
+                ; Keep buttons inside the tab: place them under the position line (prevents right-edge clipping)
+                clickTargetText.Move(indentX, y),
+                setTargetBtn.Move(indentX, y + 22),
+                clearTargetBtn.Move(indentX + 100, y + 22)
+            )
+            : (
+                clicksLbl.Visible := false, clicksPerMinEdit.Visible := false, clicksHelp.Visible := false,
+                clickTargetLabel1.Visible := false, clickTargetLabel2.Visible := false,
+                clickTargetText.Visible := false, setTargetBtn.Visible := false, clearTargetBtn.Visible := false
+            )
+    )
+
+    eventCheckboxes["MouseMovement"].OnEvent("Click", ApplyMouseTabAccordionLayout)
+    eventCheckboxes["ScrollWheel"].OnEvent("Click", ApplyMouseTabAccordionLayout)
+    eventCheckboxes["MouseClicks"].OnEvent("Click", ApplyMouseTabAccordionLayout)
     
     ; ----------------------------
     ; Keyboard tab
     ; ----------------------------
     tab.UseTab(2)
-    eventCheckboxes["KeyPresses"] := eventGui.Add("Checkbox", "x40 y100 w250", "Key Presses")
+    kbBaseX := 40
+    kbIndentX := 65
+    kbY := 100
+
+    eventCheckboxes["KeyPresses"] := eventGui.Add("Checkbox", "x" . kbBaseX . " y" . kbY . " w250", "Key Presses")
+    kbY += 30
+
+    keyActionCheckboxes := Map()
+    keyActionCheckboxes["Shift"] := eventGui.Add("Checkbox", "x" . kbIndentX . " y" . kbY . " w90", "Shift")
+    keyActionCheckboxes["Ctrl"] := eventGui.Add("Checkbox", "x" . (kbIndentX + 95) . " y" . kbY . " w80", "Ctrl")
+    keyActionCheckboxes["Alt"] := eventGui.Add("Checkbox", "x" . (kbIndentX + 175) . " y" . kbY . " w80", "Alt")
+    keyActionCheckboxes["Tab"] := eventGui.Add("Checkbox", "x" . (kbIndentX + 255) . " y" . kbY . " w80", "Tab")
+    keyActionCheckboxes["Esc"] := eventGui.Add("Checkbox", "x" . (kbIndentX + 335) . " y" . kbY . " w80", "Esc")
+
+    kbY += 26
+    ; Alt+Tab is handled by the separate "Window Switch" event to avoid duplication/confusion.
+    keyActionCheckboxes["ScrollLock"] := eventGui.Add("Checkbox", "x" . kbIndentX . " y" . kbY . " w140", "Scroll Lock")
+
+    kbY += 22
+    kbHelp := eventGui.Add("Text", "x" . kbIndentX . " y" . kbY . " w430 cGray",
+        "Select which key actions may be used. Tab/Esc/Ctrl+Tab can affect focused apps. Use Window Switch for Alt+Tab.")
+
+    ; Window switching (Alt+Tab) belongs under Keyboard
+    kbY += 35
+    eventCheckboxes["WindowSwitch"] := eventGui.Add("Checkbox", "x" . kbBaseX . " y" . kbY . " w320", "Window Switch (Alt+Tab)")
+    kbY += 22
+    winSwitchHelp := eventGui.Add("Text", "x" . kbIndentX . " y" . kbY . " w430 cGray",
+        "Performs Alt+Tab window switching (separate from Key Presses).")
+    
+    ; Tab switching (Ctrl+Tab) is a separate event (not a Key Presses sub-option)
+    kbY += 26
+    eventCheckboxes["TabSwitch"] := eventGui.Add("Checkbox", "x" . kbBaseX . " y" . kbY . " w320", "Tab Switch (Ctrl+Tab)")
+    kbY += 22
+    tabSwitchHelp := eventGui.Add("Text", "x" . kbIndentX . " y" . kbY . " w430 cGray",
+        "Performs Ctrl+Tab tab switching (separate from Key Presses).")
+
+    ; Initialize from current settings
+    for name, chk in keyActionCheckboxes {
+        if (keyPressActions.Has(name)) {
+            chk.Value := keyPressActions[name] ? 1 : 0
+        }
+    }
+
+    ApplyKeyboardKeyOptionsVisibility := (*) => (
+        show := (eventCheckboxes["KeyPresses"].Value == 1),
+        (keyActionCheckboxes["Shift"].Visible := show),
+        (keyActionCheckboxes["Ctrl"].Visible := show),
+        (keyActionCheckboxes["Alt"].Visible := show),
+        (keyActionCheckboxes["Tab"].Visible := show),
+        (keyActionCheckboxes["Esc"].Visible := show),
+        (keyActionCheckboxes["ScrollLock"].Visible := show),
+        (kbHelp.Visible := show)
+    )
+    eventCheckboxes["KeyPresses"].OnEvent("Click", ApplyKeyboardKeyOptionsVisibility)
     
     ; ----------------------------
     ; Other tab
     ; ----------------------------
     tab.UseTab(3)
-    eventCheckboxes["WindowSwitch"] := eventGui.Add("Checkbox", "x40 y100 w320", "Window Switch (Alt+Tab)")
     eventCheckboxes["HardwareAdjust"] := eventGui.Add("Checkbox", "x40 y125 w320", "Hardware Adjust")
     
     ; End tabbed section
@@ -1726,14 +2254,16 @@ ShowEventSettings() {
     for eventName, checkbox in eventCheckboxes {
         checkbox.Value := eventEnabled[eventName] ? 1 : 0
     }
+    ApplyMouseTabAccordionLayout()
+    ApplyKeyboardKeyOptionsVisibility()
 
     ; Info text
-    noteText := eventGui.Add("Text", "x20 y340 w430 cGray",
+    noteText := eventGui.Add("Text", "x20 y500 w520 cGray",
         "Tip: Use ESC to cancel target selection while the tooltip picker is active.")
     
     ; Buttons
-    saveBtn := eventGui.Add("Button", "x140 y365 w100 h30 Default", "Save")
-    cancelBtn := eventGui.Add("Button", "x250 y365 w100 h30", "Close")
+    saveBtn := eventGui.Add("Button", "x200 y525 w100 h30 Default", "Save")
+    cancelBtn := eventGui.Add("Button", "x310 y525 w100 h30", "Close")
     
     ; Store controls globally for updating
     global globalEventSettingsGuiControls
@@ -1745,7 +2275,7 @@ ShowEventSettings() {
     ))
 
     ; Button handlers
-    saveBtn.OnEvent("Click", SaveEventSettingsHandler.Bind(eventCheckboxes, eventGui))
+    saveBtn.OnEvent("Click", SaveEventSettingsHandler.Bind(eventCheckboxes, mouseMoveMaxEdit, scrollUpChk, scrollDownChk, clicksPerMinEdit, keyActionCheckboxes, eventGui))
     cancelBtn.OnEvent("Click", (*) => (globalEventSettingsGuiControls := 0, eventGui.Destroy()))
     setTargetBtn.OnEvent("Click", SetTargetPositionFromGUI.Bind(clickTargetText, setTargetBtn, clearTargetBtn,
         eventGui))
@@ -1753,23 +2283,78 @@ ShowEventSettings() {
         eventGui))
     
     ; Show window
-    eventGui.Show("w480 h410")
+    eventGui.Show("w560 h600")
 }
 
 ; Function to save event settings
-SaveEventSettingsHandler(eventCheckboxes, eventGui, *) {
-    global eventEnabled
+SaveEventSettingsHandler(eventCheckboxes, mouseMoveMaxEdit, scrollUpChk, scrollDownChk, clicksPerMinEdit, keyActionCheckboxes, eventGui, *) {
+    global eventEnabled, mouseMovementMaxIntervalSec, scrollAllowUp, scrollAllowDown, mouseClicksMaxPerMinute
+    global keyPressActions
     
     ; Save event states from checkboxes
     for eventName, checkbox in eventCheckboxes {
         eventEnabled[eventName] := (checkbox.Value == 1)
     }
+
+    ; Validate + save mouse movement max interval
+    if (eventEnabled["MouseMovement"]) {
+        try {
+            v := Float(mouseMoveMaxEdit.Value)
+            if (v < 0.1) {
+                ShowOwnedPopup(eventGui.Hwnd, "Mouse Movement max interval must be at least 0.1 seconds.", "Invalid Value")
+                return
+            }
+            mouseMovementMaxIntervalSec := v
+        } catch {
+            ShowOwnedPopup(eventGui.Hwnd, "Mouse Movement max interval must be a number (e.g., 2.5).", "Invalid Value")
+            return
+        }
+    }
+
+    ; Save scroll direction toggles
+    scrollAllowUp := (scrollUpChk.Value == 1)
+    scrollAllowDown := (scrollDownChk.Value == 1)
+
+    ; Validate + save max clicks per minute
+    if (eventEnabled["MouseClicks"]) {
+        try {
+            v2 := Integer(clicksPerMinEdit.Value)
+            if (v2 < 1) {
+                ShowOwnedPopup(eventGui.Hwnd, "Mouse Clicks max per minute must be at least 1.", "Invalid Value")
+                return
+            }
+            if (v2 > 300) {
+                v2 := 300
+            }
+            mouseClicksMaxPerMinute := v2
+            clicksPerMinEdit.Value := v2  ; reflect clamp
+        } catch {
+            ShowOwnedPopup(eventGui.Hwnd, "Mouse Clicks max per minute must be an integer (1-300).", "Invalid Value")
+            return
+        }
+    }
+
+    ; Save key action toggles (only validate when KeyPresses is enabled)
+    if (eventEnabled["KeyPresses"] && IsObject(keyActionCheckboxes)) {
+        anyOn := false
+        for name, chk in keyActionCheckboxes {
+            v3 := (chk.Value == 1)
+            keyPressActions[name] := v3
+            if (v3) {
+                anyOn := true
+            }
+        }
+        if (!anyOn) {
+            ShowOwnedPopup(eventGui.Hwnd, "Please select at least one key action for Key Presses (e.g., Shift/Ctrl/Alt).", "No Key Actions Selected")
+            return
+        }
+    }
     
     ; Log changes
-    LogActivity("Event Settings", "Event settings updated")
-    
-    ; Close window
-    eventGui.Destroy()
+    LogActivity("Event Settings", "Updated mouse settings (move max=" . mouseMovementMaxIntervalSec . "s, clicks max=" . mouseClicksMaxPerMinute . "/min)")
+
+    ; Keep window open on Save (apply immediately)
+    ShowOwnedPopup(eventGui.Hwnd, "Event settings saved. Changes are active now.", "Saved")
 }
 
 ; Custom hotkey: Ctrl+Alt+Shift+S (unused by browsers, Windows, or editors)
@@ -1788,8 +2373,8 @@ ShowGeneralSettings() {
     defaultInactivityJitter := 1000      ; From global: inactivityJitter
     defaultActionBufferTime := 3000      ; From global: actionBufferTime
 
-    ; Create GUI for settings (resizable with minimum size to prevent scrolling)
-    settingsGui := Gui("+AlwaysOnTop +Resize +MinSize470x350", "General Settings")
+    ; Create GUI for settings (match Event Settings style, but allow resize to avoid clipping on small screens)
+    settingsGui := Gui("+AlwaysOnTop +Resize +MinSize480x380", "General Settings")
     settingsGui.SetFont("s10", "Segoe UI")
 
     ; Calculate default values for display (from global variables)
@@ -1797,40 +2382,59 @@ ShowGeneralSettings() {
     defaultJitterSec := Round(defaultInactivityJitter / 1000)
     defaultBufferSec := Round(defaultActionBufferTime / 1000)
 
-    ; Inactivity Threshold (seconds)
-    thresholdLabel1 := settingsGui.Add("Text", "x20 y20 w400", "Inactivity Threshold (seconds):")
-    thresholdLabel2 := settingsGui.Add("Text", "x20 y35 w400 cGray",
-        "How long to wait before starting activity simulation (when user is idle)")
-    thresholdEdit := settingsGui.Add("Edit", "x20 y55 w200", Round(inactivityThreshold / 1000))
-    thresholdEdit.SetFont("s10", "Segoe UI")
-    thresholdDefaultText := settingsGui.Add("Text", "x230 y57 w150", "Default: " . defaultThresholdSec . " seconds"
-    )
+    ; Header
+    settingsGui.Add("Text", "x20 y15 w440", "General Settings")
+    settingsGui.Add("Text", "x20 y35 w440 cGray", "Adjust timings used to detect inactivity and avoid patterns.")
 
-    ; Inactivity Jitter (seconds)
-    jitterLabel1 := settingsGui.Add("Text", "x20 y100 w400", "Inactivity Jitter (±seconds):")
-    jitterLabel2 := settingsGui.Add("Text", "x20 y115 w400 cGray",
-        "Random variation added to threshold to avoid fixed timing patterns"
-    )
-    jitterEdit := settingsGui.Add("Edit", "x20 y135 w200", Round(inactivityJitter / 1000))
-    jitterEdit.SetFont("s10", "Segoe UI")
-    jitterDefaultText := settingsGui.Add("Text", "x230 y137 w150", "Default: ±" . defaultJitterSec . " second")
+    tab := settingsGui.Add("Tab3", "x20 y60 w440 h260", ["Timing", "Info"])
 
-    ; Action Buffer Time (seconds)
-    bufferLabel1 := settingsGui.Add("Text", "x20 y180 w400", "Action Buffer Time (seconds):")
-    bufferLabel2 := settingsGui.Add("Text", "x20 y195 w400 cGray",
-        "Delay after script actions before checking for real user input")
-    bufferEdit := settingsGui.Add("Edit", "x20 y215 w200", Round(actionBufferTime / 1000))
-    bufferEdit.SetFont("s10", "Segoe UI")
-    bufferDefaultText := settingsGui.Add("Text", "x230 y217 w150", "Default: " . defaultBufferSec . " seconds")
+    ; ----------------------------
+    ; Timing tab
+    ; ----------------------------
+    tab.UseTab(1)
+    ; Layout constants (keeps spacing consistent)
+    leftX := 40
+    editX := 40
+    editW := 120
+    defaultX := 175
+    rowGap := 72
+    labelW := 280
+    descW := 350
+    defaultW := 230
 
-    ; Info text
-    noteText := settingsGui.Add("Text", "x20 y260 w400 cGray",
-        "Note: Changes take effect immediately.`nEvent settings and mouse click target are available in the tray menu (right-click tray icon).")
+    y0 := 92
+    settingsGui.Add("Text", "x" . leftX . " y" . y0 . " w" . labelW, "Inactivity Threshold (seconds)")
+    settingsGui.Add("Text", "x" . leftX . " y" . (y0 + 17) . " w" . descW . " cGray", "How long to wait before starting simulation")
+    thresholdEdit := settingsGui.Add("Edit", "x" . editX . " y" . (y0 + 37) . " w" . editW, Round(inactivityThreshold / 1000))
+    settingsGui.Add("Text", "x" . defaultX . " y" . (y0 + 40) . " w" . defaultW . " cGray", "Default: " . defaultThresholdSec . "s")
+
+    y1 := y0 + rowGap
+    settingsGui.Add("Text", "x" . leftX . " y" . y1 . " w" . labelW, "Inactivity Jitter (±seconds)")
+    settingsGui.Add("Text", "x" . leftX . " y" . (y1 + 17) . " w" . descW . " cGray", "Random variation added to threshold")
+    jitterEdit := settingsGui.Add("Edit", "x" . editX . " y" . (y1 + 37) . " w" . editW, Round(inactivityJitter / 1000))
+    settingsGui.Add("Text", "x" . defaultX . " y" . (y1 + 40) . " w" . defaultW . " cGray", "Default: ±" . defaultJitterSec . "s")
+
+    y2 := y1 + rowGap
+    settingsGui.Add("Text", "x" . leftX . " y" . y2 . " w" . labelW, "Action Buffer Time (seconds)")
+    settingsGui.Add("Text", "x" . leftX . " y" . (y2 + 17) . " w" . descW . " cGray", "Delay after script actions before checking user input")
+    bufferEdit := settingsGui.Add("Edit", "x" . editX . " y" . (y2 + 37) . " w" . editW, Round(actionBufferTime / 1000))
+    settingsGui.Add("Text", "x" . defaultX . " y" . (y2 + 40) . " w" . defaultW . " cGray", "Default: " . defaultBufferSec . "s")
+
+    ; ----------------------------
+    ; Info tab
+    ; ----------------------------
+    tab.UseTab(2)
+    settingsGui.Add("Text", "x40 y110 w390", "Related settings are in the tray menu:")
+    settingsGui.Add("Text", "x40 y130 w390 cGray", "- Event Settings (mouse/keyboard toggles)")
+    settingsGui.Add("Text", "x40 y148 w390 cGray", "- Mouse Click Target Position (inside Event Settings → Mouse tab)")
+    settingsGui.Add("Text", "x40 y175 w390 cGray", "Note: Changes take effect immediately.")
+
+    tab.UseTab()
 
     ; Buttons (Cancel acts as close button)
-    saveBtn := settingsGui.Add("Button", "x120 y300 w100 h30 Default", "Save")
-    cancelBtn := settingsGui.Add("Button", "x230 y300 w100 h30", "Close")
-    resetBtn := settingsGui.Add("Button", "x20 y300 w90 h30", "Reset")
+    resetBtn := settingsGui.Add("Button", "x20 y300 w100 h30", "Reset")
+    saveBtn := settingsGui.Add("Button", "x260 y300 w100 h30 Default", "Save")
+    cancelBtn := settingsGui.Add("Button", "x360 y300 w100 h30", "Close")
 
     ; Button handlers using closures
     saveBtn.OnEvent("Click", SaveSettingsHandler.Bind(thresholdEdit, jitterEdit, bufferEdit, settingsGui))
@@ -1838,15 +2442,31 @@ ShowGeneralSettings() {
     resetBtn.OnEvent("Click", ResetSettingsHandler.Bind(thresholdEdit, jitterEdit, bufferEdit, defaultThresholdSec,
         defaultJitterSec, defaultBufferSec))
 
-    ; Handle window resize - pass all controls that need resizing and settingsGui
-    settingsGui.OnEvent("Size", ResizeGeneralSettings.Bind(thresholdEdit, jitterEdit, bufferEdit,
-        thresholdLabel1, thresholdLabel2, thresholdDefaultText,
-        jitterLabel1, jitterLabel2, jitterDefaultText,
-        bufferLabel1, bufferLabel2, bufferDefaultText,
-        noteText, saveBtn, cancelBtn, resetBtn, settingsGui))
+    ; Keep tab + buttons laid out when resized (AHK doesn't auto-scroll tabs)
+    settingsGui.OnEvent("Size", GeneralSettings_OnResize.Bind(tab, resetBtn, saveBtn, cancelBtn))
 
     ; Show window
-    settingsGui.Show("w470 h350")
+    settingsGui.Show("w480 h400")
+}
+
+GeneralSettings_OnResize(tabCtrl, resetBtn, saveBtn, cancelBtn, guiObj, minMax, width, height) {
+    try {
+        marginX := 20
+        topY := 60
+        bottomButtonsH := 30
+        bottomMargin := 20
+        tabH := Max(240, height - (topY + bottomButtonsH + bottomMargin + 20))
+        tabW := Max(440, width - (marginX * 2))
+
+        tabCtrl.Move(marginX, topY, tabW, tabH)
+
+        btnY := topY + tabH + 15
+        resetBtn.Move(marginX, btnY)
+        cancelBtn.Move(width - marginX - 100, btnY)
+        saveBtn.Move(width - marginX - 100 - 10 - 100, btnY)
+    } catch {
+        ; ignore resize errors
+    }
 }
 
 ; Helper function to show always-on-top message
@@ -1912,19 +2532,19 @@ SaveSettingsHandler(thresholdEdit, jitterEdit, bufferEdit, settingsGui, *) {
 
     ; Validate threshold (1-60 seconds)
     if (thresholdValue < 1 || thresholdValue > 60) {
-        ShowAlwaysOnTopMessage("Inactivity Threshold must be between 1 and 60 seconds!", "Invalid Value")
+        ShowOwnedPopup(settingsGui.Hwnd, "Inactivity Threshold must be between 1 and 60 seconds!", "Invalid Value")
         return
     }
 
     ; Validate jitter (0-10 seconds)
     if (jitterValue < 0 || jitterValue > 10) {
-        ShowAlwaysOnTopMessage("Inactivity Jitter must be between 0 and 10 seconds!", "Invalid Value")
+        ShowOwnedPopup(settingsGui.Hwnd, "Inactivity Jitter must be between 0 and 10 seconds!", "Invalid Value")
         return
     }
 
     ; Validate buffer (1-10 seconds)
     if (bufferValue < 1 || bufferValue > 10) {
-        ShowAlwaysOnTopMessage("Action Buffer Time must be between 1 and 10 seconds!", "Invalid Value")
+        ShowOwnedPopup(settingsGui.Hwnd, "Action Buffer Time must be between 1 and 10 seconds!", "Invalid Value")
         return
     }
 
@@ -1935,64 +2555,16 @@ SaveSettingsHandler(thresholdEdit, jitterEdit, bufferEdit, settingsGui, *) {
 
     ; Settings are runtime-only (no longer saved to INI file)
 
-    ; Show confirmation (positioned above settings window, always on top)
-    settingsWinTitle := "General Settings"
     msgBoxText := "Settings saved successfully!`n`n" .
         "Inactivity Threshold: " . thresholdValue . " seconds`n" .
         "Inactivity Jitter: ±" . jitterValue . " seconds`n" .
         "Action Buffer Time: " . bufferValue . " seconds`n`n" .
         "Changes are now active."
-
-    ; Check if settings window exists and get its position
-    if (WinExist(settingsWinTitle)) {
-        try {
-            ; Get settings window position
-            WinGetPos(&settingsX, &settingsY, &settingsW, &settingsH, settingsWinTitle)
-            ; Calculate message box position (above settings window)
-            msgBoxHeight := 200
-            msgBoxWidth := 420
-            msgX := settingsX + 25
-            msgY := Max(10, settingsY - msgBoxHeight - 10)  ; Ensure it's on screen
-
-            ; Create a custom message GUI positioned above the settings window
-            msgGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox -MinimizeBox", "Settings Saved")
-            msgGui.SetFont("s10", "Segoe UI")
-            msgGui.Add("Text", "x10 y10 w400", msgBoxText)
-            okBtn := msgGui.Add("Button", "x170 y160 w80 h30 Default", "OK")
-            okBtn.OnEvent("Click", (*) => msgGui.Destroy())
-            ; Position above settings window
-            msgGui.Show("x" . msgX . " y" . msgY . " w" . msgBoxWidth . " h" . msgBoxHeight)
-            ; Bring to front
-            WinActivate("ahk_id " . msgGui.Hwnd)
-            ; Wait for user to close
-            WinWaitClose("ahk_id " . msgGui.Hwnd)
-        } catch {
-            ; Fallback to regular MsgBox if custom GUI fails
-            MsgBox(msgBoxText, "Settings Saved", "OK")
-        }
-    } else {
-        ; Settings window not open, center on screen with always on top
-        try {
-            msgGui := Gui("+AlwaysOnTop +ToolWindow -MaximizeBox -MinimizeBox", "Settings Saved")
-            msgGui.SetFont("s10", "Segoe UI")
-            msgGui.Add("Text", "x10 y10 w400", msgBoxText)
-            okBtn := msgGui.Add("Button", "x170 y160 w80 h30 Default", "OK")
-            okBtn.OnEvent("Click", (*) => msgGui.Destroy())
-            ; Center on screen
-            msgGui.Show("w420 h200")
-            ; Bring to front
-            WinActivate("ahk_id " . msgGui.Hwnd)
-            ; Wait for user to close
-            WinWaitClose("ahk_id " . msgGui.Hwnd)
-        } catch {
-            ; Fallback to regular MsgBox if custom GUI fails
-            MsgBox(msgBoxText, "Settings Saved", "OK")
-        }
-    }
+    ShowOwnedPopup(settingsGui.Hwnd, msgBoxText, "Settings Saved")
 
     LogActivity("Settings", "Updated: Threshold=" . thresholdValue . "s, Jitter=±" . jitterValue . "s, Buffer=" .
         bufferValue . "s")
-    settingsGui.Destroy()
+    ; Keep window open on Save (apply immediately)
 }
 
 ; Function to reset settings to defaults
@@ -2187,21 +2759,26 @@ ResizeServiceSettings(serviceListEdit, guiObj, minMax, width, height) {
 ShowServiceSettings() {
     global pauseServices, serviceCheckEnabled
 
-    ; Create GUI for service settings (resizable with close button)
-    serviceGui := Gui("+AlwaysOnTop +Resize", "Service Pause Settings")
+    ; Create GUI for service settings (match Event Settings style)
+    serviceGui := Gui("+AlwaysOnTop -Resize", "Service Pause Settings")
     serviceGui.SetFont("s10", "Segoe UI")
 
-    ; Title
-    serviceGui.Add("Text", "x20 y20 w560", "Pause script when these services/processes are running:")
-    serviceGui.Add("Text", "x20 y40 w560 cGray", "Enter service/process names manually (one per line)")
+    ; Header
+    serviceGui.Add("Text", "x20 y15 w440", "Service Pause Settings")
+    serviceGui.Add("Text", "x20 y35 w440 cGray", "Pause simulation when any listed processes/services are running.")
 
-    ; Enable/Disable checkbox
-    enableCheckbox := serviceGui.Add("Checkbox", "x20 y70 w300", "Enable service checking")
+    tab := serviceGui.Add("Tab3", "x20 y60 w440 h250", ["Services", "Info"])
+
+    ; ----------------------------
+    ; Services tab
+    ; ----------------------------
+    tab.UseTab(1)
+    enableCheckbox := serviceGui.Add("Checkbox", "x40 y100 w360", "Enable service checking")
     enableCheckbox.Value := serviceCheckEnabled ? 1 : 0
 
-    ; Service list (multi-line edit) - smaller size (6 rows, ~50 characters width)
-    serviceGui.Add("Text", "x20 y100 w200", "Service/Process Names (one per line):")
-    serviceListEdit := serviceGui.Add("Edit", "x20 y120 w400 h100 Multi VScroll", "")
+    serviceGui.Add("Text", "x40 y130 w380", "Service/Process names (one per line):")
+    serviceGui.Add("Text", "x40 y148 w380 cGray", "Examples: chrome.exe, notepad.exe")
+    serviceListEdit := serviceGui.Add("Edit", "x40 y170 w380 h110 Multi VScroll", "")
 
     ; Placeholder text constant
     placeholderText := "chrome.exe`r`nnotepad.exe`r`nhello.txt`r`nworldmap.exe`r`nd2x.dll"
@@ -2221,25 +2798,29 @@ ShowServiceSettings() {
     ; Clear placeholder when user focuses on edit box
     serviceListEdit.OnEvent("Focus", ClearPlaceholder.Bind(serviceListEdit, placeholderText))
 
-    ; Info text (positioned after text box with proper spacing)
-    serviceGui.Add("Text", "x20 y230 w400 cGray",
-        "Note: Enter exact service/process names. The script will pause when any of these are running.")
+    ; ----------------------------
+    ; Info tab
+    ; ----------------------------
+    tab.UseTab(2)
+    serviceGui.Add("Text", "x40 y110 w390", "How it works:")
+    serviceGui.Add("Text", "x40 y130 w390 cGray", "- When enabled, the script periodically checks for these names.")
+    serviceGui.Add("Text", "x40 y148 w390 cGray", "- If any are running, simulation pauses automatically.")
+    serviceGui.Add("Text", "x40 y175 w390 cGray", "Tip: Use exact process names (e.g., chrome.exe).")
+
+    tab.UseTab()
 
     ; Buttons (positioned with proper spacing, no overlap)
-    clearBtn := serviceGui.Add("Button", "x20 y270 w100 h30", "Clear All")
-    saveBtn := serviceGui.Add("Button", "x130 y270 w100 h30 Default", "Save")
-    cancelBtn := serviceGui.Add("Button", "x240 y270 w100 h30", "Close")
+    clearBtn := serviceGui.Add("Button", "x20 y325 w100 h30", "Clear All")
+    saveBtn := serviceGui.Add("Button", "x260 y325 w100 h30 Default", "Save")
+    cancelBtn := serviceGui.Add("Button", "x360 y325 w100 h30", "Close")
 
     ; Button handlers
     clearBtn.OnEvent("Click", ClearServiceList.Bind(serviceListEdit))
     saveBtn.OnEvent("Click", SaveServiceSettings.Bind(serviceListEdit, enableCheckbox, serviceGui))
     cancelBtn.OnEvent("Click", (*) => serviceGui.Destroy())
 
-    ; Handle window resize
-    serviceGui.OnEvent("Size", ResizeServiceSettings.Bind(serviceListEdit))
-
-    ; Show GUI (resizable, properly sized to avoid overlap)
-    serviceGui.Show("w450 h320")
+    ; Show GUI
+    serviceGui.Show("w480 h370")
 }
 
 ; Function to clear service list
@@ -2300,165 +2881,40 @@ SaveServiceSettings(serviceListEdit, enableCheckbox, serviceGui, *) {
             serviceList := Trim(serviceList, ", ")
         }
 
-        MsgBox(
+        ShowOwnedPopup(
+            serviceGui.Hwnd,
             "Service pause settings saved!`n`n" .
             "Service checking: " . (serviceCheckEnabled ? "Enabled" : "Disabled") . "`n" .
             "Services to monitor: " . serviceCount . "`n" .
             "Services: " . serviceList . "`n`n" .
-            "Script will pause when any of these services are running.",
-            "Service Settings Saved",
-            "OK"
+            "Script will pause when any of these are running.",
+            "Service Settings Saved"
         )
     } else if (serviceCheckEnabled && serviceCount == 0) {
-        MsgBox(
+        ShowOwnedPopup(
+            serviceGui.Hwnd,
             "Service checking is enabled but no services are configured.`n`n" .
-            "Please add at least one service name.",
-            "No Services Configured",
-            "OK"
+            "Please add at least one service/process name.",
+            "No Services Configured"
         )
         return
     } else {
-        MsgBox(
+        ShowOwnedPopup(
+            serviceGui.Hwnd,
             "Service pause settings saved!`n`n" .
             "Service checking: Disabled",
-            "Service Settings Saved",
-            "OK"
+            "Service Settings Saved"
         )
     }
 
     LogActivity("Service Settings", "Updated: " . serviceCount . " service(s), Enabled: " . (serviceCheckEnabled ?
         "Yes" : "No"))
-    serviceGui.Destroy()
+    ; Keep window open on Save (apply immediately)
 }
 
 ; Custom hotkey: Ctrl+Alt+Shift+T (unused by browsers, Windows, or editors)
 ^!+t:: {  ; Ctrl+Alt+Shift+T: Schedule Auto-Quit
-    global scheduledQuitTime
-
-    ; If already scheduled, offer to cancel
-    if (scheduledQuitTime != 0) {
-        result := MsgBox(
-            "Auto-quit is already scheduled.`n`n" .
-            "Do you want to cancel the scheduled auto-quit?",
-            "Cancel Scheduled Auto-Quit",
-            "YesNo"
-        )
-        if (result == "Yes") {
-            scheduledQuitTime := 0
-            SetTimer(CheckScheduledQuit, 0)
-            MsgBox("Scheduled auto-quit has been cancelled.", "Cancelled", "OK")
-            LogActivity("Scheduled Quit", "Cancelled scheduled auto-quit")
-            return
-        } else {
-            return
-        }
-    }
-
-    ; Prompt user for hours and minutes (format: HH:MM or just hours)
-    ; InputBox(Prompt, Title, Options, Default)
-    hoursInput := InputBox(
-        "Enter time before auto-quit:`n`n" .
-        "Format: HH:MM (e.g., 2:30 for 2 hours 30 minutes)`n" .
-        "Or just hours (e.g., 3 for 3 hours)`n`n" .
-        "Script will automatically quit after the specified time.`n`n" .
-        "Maximum: 24:00 (24 hours)`n`n" .
-        "Example: 2:30 or 3",
-        "Schedule Auto-Quit",
-        "",
-        "2:30"
-    )
-
-    ; Check if user cancelled
-    if (hoursInput.Result != "OK" || hoursInput.Value == "") {
-        return
-    }
-
-    ; Parse input - check if it contains colon (HH:MM format)
-    inputValue := Trim(hoursInput.Value)
-    totalMilliseconds := 0
-
-    if (InStr(inputValue, ":")) {
-        ; Format: HH:MM
-        parts := StrSplit(inputValue, ":")
-        if (parts.Length != 2) {
-            MsgBox("Invalid format! Please use HH:MM (e.g., 2:30) or just hours (e.g., 3)", "Invalid Format", "OK")
-            return
-        }
-
-        hours := Integer(parts[1])
-        minutes := Integer(parts[2])
-
-        ; Validate hours (0-24)
-        if (hours < 0 || hours > 24) {
-            MsgBox("Hours must be between 0 and 24!", "Invalid Hours", "OK")
-            return
-        }
-
-        ; Validate minutes (0-59)
-        if (minutes < 0 || minutes > 59) {
-            MsgBox("Minutes must be between 0 and 59!", "Invalid Minutes", "OK")
-            return
-        }
-
-        ; Check total time doesn't exceed 24 hours
-        if (hours == 24 && minutes > 0) {
-            MsgBox("Maximum time is 24:00 (24 hours)!", "Invalid Time", "OK")
-            return
-        }
-
-        ; Calculate total milliseconds
-        totalMilliseconds := (hours * 3600000) + (minutes * 60000)
-
-        ; Display format for confirmation
-        timeDisplay := hours . " hour(s) " . minutes . " minute(s)"
-    } else {
-        ; Format: Just hours
-        hours := Integer(inputValue)
-
-        ; Validate hours (1-24)
-        if (hours < 1 || hours > 24) {
-            MsgBox("Hours must be between 1 and 24!", "Invalid Hours", "OK")
-            return
-        }
-
-        ; Calculate total milliseconds
-        totalMilliseconds := hours * 3600000
-
-        ; Display format for confirmation
-        timeDisplay := hours . " hour(s)"
-    }
-
-    ; Calculate quit time (current time + total milliseconds)
-    scheduledQuitTime := A_TickCount + totalMilliseconds
-
-    ; Start timer to check every minute if it's time to quit
-    SetTimer(CheckScheduledQuit, 60000)  ; Check every 60 seconds
-
-    ; Calculate time remaining for display
-    totalSecondsRemaining := (scheduledQuitTime - A_TickCount) / 1000
-    hoursRemaining := Floor(totalSecondsRemaining / 3600)
-    minutesRemaining := Floor((totalSecondsRemaining - (hoursRemaining * 3600)) / 60)
-
-    ; Format time remaining display
-    if (hoursRemaining > 0 && minutesRemaining > 0) {
-        timeRemainingDisplay := hoursRemaining . "h " . minutesRemaining . "m"
-    } else if (hoursRemaining > 0) {
-        timeRemainingDisplay := hoursRemaining . "h"
-    } else {
-        timeRemainingDisplay := minutesRemaining . "m"
-    }
-
-    ; Show confirmation
-    MsgBox(
-        "Auto-quit scheduled!`n`n" .
-        "Script will quit after: " . timeDisplay . "`n`n" .
-        "Time remaining: " . timeRemainingDisplay . "`n`n" .
-        "Press Ctrl+Alt+Shift+T again to cancel.",
-        "Scheduled Auto-Quit",
-        "OK"
-    )
-
-    LogActivity("Scheduled Quit", "Scheduled to quit after " . timeDisplay)
+    ShowAutoQuitSettings()
 }
 
 ; Function to check if scheduled quit time has been reached
@@ -2705,7 +3161,7 @@ A_TrayMenu.Add(trayToggleMenuCurrentLabel := "Toggle Simulation", (*) => ToggleP
 A_TrayMenu.Add()  ; Separator
 A_TrayMenu.Add("Event Settings", (*) => ShowEventSettings())
 A_TrayMenu.Add("General Settings (Ctrl+Alt+Shift+S)", (*) => Send("^!+s"))
-A_TrayMenu.Add("Auto-Quit setting (Ctrl+Alt+Shift+T)", (*) => Send("^!+t"))
+A_TrayMenu.Add("Auto-Quit setting (Ctrl+Alt+Shift+T)", (*) => ShowAutoQuitSettings())
 A_TrayMenu.Add("Service Pause Settings", (*) => ShowServiceSettings())
 A_TrayMenu.Add()  ; Separator
 A_TrayMenu.Add("Exit (Ctrl+Alt+Q)", (*) => ExitApp())
@@ -2793,6 +3249,7 @@ CheckServiceStatus() {
         if (simulationActive) {
             simulationActive := false
             SetTimer(SimulateHuman, 0)
+            StopClickScheduler()
             LogActivity("Service Check", "Paused - Service is running")
             UpdateTrayIcon()
         }
