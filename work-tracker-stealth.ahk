@@ -2,6 +2,10 @@
 #SingleInstance Force
 ; Tray icon always visible for owner to see status
 
+; Ensure all mouse coordinates are SCREEN-based (prevents bottom-right bias from window-relative coords)
+CoordMode("Mouse", "Screen")
+CoordMode("ToolTip", "Screen")
+
 ; ============================================
 ; Work Tracker Stealth - AutoHotkey Script
 ; Developed by Qwery Technolabs
@@ -18,6 +22,9 @@
 ; ============================================
 ; GLOBAL VARIABLES & CONFIGURATION
 ; ============================================
+; Debugging (set to 1 to enable extra debug entries in the Activity Log)
+debugEnabled := 0
+
 inactivityThreshold := 50000  ; 50 seconds in milliseconds
 inactivityJitter := 1000      ; ±1 second jitter (9-11s range)
 lastInputTime := 0
@@ -31,9 +38,9 @@ lastScriptInputTime := 0  ; Track last input time when script was active
 lastMousePos := { x: 0, y: 0 }
 lastPositions := []  ; Track last 5 positions to avoid repetition
 
-; Activity log for real-time monitoring (stores last 50 activities)
+; Activity log for real-time monitoring (stores last N activities)
 activityLog := []
-maxLogEntries := 50
+maxLogEntries := 200
 
 ; Real-time activity tracking
 currentActivity := "Idle - Monitoring inactivity"
@@ -46,13 +53,26 @@ pauseServices := []  ; Array of service names to pause when running
 serviceCheckEnabled := false  ; Whether to check services
 
 ; Mouse click target position (0 = not set, otherwise {x: X, y: Y})
+; Stored as monitor-relative coordinates so (0,0) is the top-left of the chosen display:
+; { mon: N, relX: xFromLeft, relY: yFromTop }
 mouseClickTargetPos := 0  ; Target position for multiple left-clicks
 
 ; Mouse behavior tuning (runtime-only)
-mouseMovementMaxIntervalSec := 10.0  ; Random mouse-move will happen within 0.1s..this max (when enabled)
 scrollAllowUp := true
 scrollAllowDown := true
 mouseClicksMaxPerMinute := 60  ; Randomized 1..this per minute (cap 300). Applies when target is set.
+mouseClickHoldMaxMs := 650     ; Mouse button hold duration max (ms) for clicks (randomized up to this)
+clickTargetJitterPx := 5       ; Target click jitter range (±px). Min 1. Max = half of the monitor size.
+
+; Hardware Adjust sub-options (runtime-only)
+; Hardware Adjust can change real system brightness/volume. Use these toggles to control what it’s allowed to do.
+hardwareAdjustBrightness := true
+hardwareAdjustBrightnessUseFunctionKeys := true  ; tries {Brightness_Up}/{Brightness_Down}
+hardwareAdjustBrightnessUseWmi := true           ; tries PowerShell/WMI brightness API
+hardwareAdjustVolume := true
+hardwareAdjustVolumeUp := true
+hardwareAdjustVolumeDown := true
+hardwareAdjustVolumeAllowMute := true            ; allow {Volume_Mute} toggle
 
 ; Click scheduler state (internal)
 clickWindowStartTick := 0
@@ -60,6 +80,8 @@ clicksThisWindowLimit := 0
 clicksThisWindowDone := 0
 nextTargetClickAt := 0
 clickSchedulerRunning := false
+clickSessionActiveUntil := 0
+clickSessionRemaining := 0
 
 ; Event enable/disable states (all enabled by default)
 eventEnabled := Map(
@@ -97,6 +119,56 @@ LogActivity(activityType, details := "") {
     }
 }
 
+; Human-readable action log helper (matches "mouse:" / "keyboard:" style)
+LogAction(domain, message) {
+    ; domain examples: "mouse", "keyboard", "system", "sim", "service", "debug"
+    LogActivity(domain, message)
+}
+
+; Debug helper (writes into the same Activity Log)
+DebugLog(details, category := "Debug") {
+    global debugEnabled
+    if (!debugEnabled) {
+        return
+    }
+    try {
+        LogActivity(category, details)
+    } catch {
+        ; ignore debug failures
+    }
+}
+
+JoinStrings(delim, items*) {
+    out := ""
+    for v in items {
+        if (out != "") {
+            out .= delim
+        }
+        out .= v
+    }
+    return out
+}
+
+FormatJitterHelpText(jitterPx) {
+    try {
+        j := Integer(jitterPx)
+    } catch {
+        j := 5
+    }
+    if (j < 1) {
+        j := 1
+    }
+    return "Clicks will jitter within a " . (j * 2) . "×" . (j * 2) . " px box around the target (±" . j . "px)"
+}
+
+SafeInt(val, fallback := 0) {
+    try {
+        return Integer(val)
+    } catch {
+        return fallback
+    }
+}
+
 ; Safe key list (modifier keys only - won't interfere with documents/code or laptop hardware)
 ; Modifier keys (Ctrl, Alt, Shift) do nothing when pressed alone - completely safe
 ; These keys won't trigger brightness, volume, or any hardware functions on laptops
@@ -112,7 +184,9 @@ keyPressActions := Map(
     "Alt",   true,
     "Tab",   true,
     "Esc",   true,
-    "ScrollLock", true
+    "ScrollLock", true,
+    "CapsLock", true,
+    "NumLock", true
 )
 
 ; Random mouse movement - no patterns, completely random across screen
@@ -263,7 +337,6 @@ CheckInactivity() {
             ; Random initial delay before first action (5-15 seconds)
             initialDelay := Random(5000, 15000)
             SetTimer(SimulateHuman, initialDelay)
-            EnsureClickSchedulerRunning()
             LogActivity("Simulation", "Started - Inactivity detected (" . Round(timeSinceInput / 1000) . "s)")
             UpdateTrayIcon()  ; Update to red X icon when active
         }
@@ -408,6 +481,37 @@ ClearScriptActionFlag() {
     lastScriptInputTime := GetLastInputInfo()
 }
 
+; Mark a short window as "script is generating input" so CheckUserInput won't self-pause.
+; Use this for timer-based actions (click scheduler / delayed scroll) that occur outside SimulateHuman().
+BeginScriptInputWindow(durationMs := 250) {
+    global scriptActionInProgress, scriptActionStartTime
+    scriptActionStartTime := DllCall("kernel32\GetTickCount", "UInt")
+    scriptActionInProgress := true
+    try {
+        durationMs := Max(50, Integer(durationMs))
+    } catch {
+        durationMs := 250
+    }
+    SetTimer(ClearScriptActionFlag, -durationMs)
+}
+
+; Prevent mouse movement + mouse clicks from running at the same time (avoids "spoiled" movement).
+mouseActionInProgress := false
+
+TryBeginMouseAction() {
+    global mouseActionInProgress
+    if (mouseActionInProgress) {
+        return false
+    }
+    mouseActionInProgress := true
+    return true
+}
+
+EndMouseAction() {
+    global mouseActionInProgress
+    mouseActionInProgress := false
+}
+
 ; ============================================
 ; HUMAN-LIKE MOUSE MOVEMENTS
 ; ============================================
@@ -480,12 +584,19 @@ OvalShapeMovement(centerX, centerY, radiusX, radiusY, steps := 20) {
 ; Movements cover large portions of screen, very speedy, includes random oval shapes
 ; Always moves from current mouse position (no skipping)
 RandomScreenMovement() {
-    ; Get screen dimensions
-    screenWidth := A_ScreenWidth
-    screenHeight := A_ScreenHeight
+    ; Multi-monitor safe movement:
+    ; - Uses the monitor containing the cursor for small/medium moves.
+    ; - Uses any monitor for waypoint/oval moves.
+    ; - Never targets exactly on the border: 2px inside on all edges.
+    edgePad := 2
 
-    ; Get current mouse position (start from where mouse is now)
     MouseGetPos(&currentX, &currentY)
+    GetMonitorRectFromPoint(currentX, currentY, &ml, &mt, &mr, &mb, &curMon)
+    monCount := MonitorGetCount()
+
+    GetSafeRectForMonitor(curMon, edgePad, &safeL, &safeT, &safeR, &safeB)
+    midX := safeL + Round((safeR - safeL) / 2)
+    midY := safeT + Round((safeB - safeT) / 2)
 
     ; Movement type: 15% small, 25% medium, 30% large waypoints, 30% oval shape
     ; Added oval shape option (30%) - random, not always oval
@@ -494,37 +605,37 @@ RandomScreenMovement() {
     if (movementType <= 3) {
         ; 15% - Small movement - move to opposite area of screen from current position
         ; Choose destination far from current position
-        if (currentX < screenWidth / 2) {
-            newX := Random(screenWidth / 2, screenWidth - 10)  ; Move to right side
+        if (currentX < midX) {
+            newX := Random(midX, safeR)  ; Move to right side (same monitor)
         } else {
-            newX := Random(10, screenWidth / 2)  ; Move to left side
+            newX := Random(safeL, midX)  ; Move to left side
         }
-        if (currentY < screenHeight / 2) {
-            newY := Random(screenHeight / 2, screenHeight - 10)  ; Move to bottom
+        if (currentY < midY) {
+            newY := Random(midY, safeB)  ; Move to bottom
         } else {
-            newY := Random(10, screenHeight / 2)  ; Move to top
+            newY := Random(safeT, midY)  ; Move to top
         }
         MouseMoveSmooth(newX, newY, Random(1, 2))
 
     } else if (movementType <= 8) {
         ; 25% - Medium movement - move to completely different area from current position
         ; Choose destination in opposite quadrant
-        if (currentX < screenWidth / 2 && currentY < screenHeight / 2) {
+        if (currentX < midX && currentY < midY) {
             ; Currently top-left, go to bottom-right
-            newX := Random(screenWidth / 2, screenWidth - 10)
-            newY := Random(screenHeight / 2, screenHeight - 10)
-        } else if (currentX >= screenWidth / 2 && currentY < screenHeight / 2) {
+            newX := Random(midX, safeR)
+            newY := Random(midY, safeB)
+        } else if (currentX >= midX && currentY < midY) {
             ; Currently top-right, go to bottom-left
-            newX := Random(10, screenWidth / 2)
-            newY := Random(screenHeight / 2, screenHeight - 10)
-        } else if (currentX < screenWidth / 2 && currentY >= screenHeight / 2) {
+            newX := Random(safeL, midX)
+            newY := Random(midY, safeB)
+        } else if (currentX < midX && currentY >= midY) {
             ; Currently bottom-left, go to top-right
-            newX := Random(screenWidth / 2, screenWidth - 10)
-            newY := Random(10, screenHeight / 2)
+            newX := Random(midX, safeR)
+            newY := Random(safeT, midY)
         } else {
             ; Currently bottom-right, go to top-left
-            newX := Random(10, screenWidth / 2)
-            newY := Random(10, screenHeight / 2)
+            newX := Random(safeL, midX)
+            newY := Random(safeT, midY)
         }
         MouseMoveSmooth(newX, newY, Random(1, 2))
 
@@ -547,25 +658,11 @@ RandomScreenMovement() {
         }
 
         loop waypointCount {
-            ; Each waypoint should be in a different quadrant/area
-            quadrant := quadrants[Mod(A_Index - 1, quadrants.Length) + 1]
-            if (quadrant == 1) {
-                ; Top-left quadrant
-                waypointX := Random(10, screenWidth / 2)
-                waypointY := Random(10, screenHeight / 2)
-            } else if (quadrant == 2) {
-                ; Top-right quadrant
-                waypointX := Random(screenWidth / 2, screenWidth - 10)
-                waypointY := Random(10, screenHeight / 2)
-            } else if (quadrant == 3) {
-                ; Bottom-left quadrant
-                waypointX := Random(10, screenWidth / 2)
-                waypointY := Random(screenHeight / 2, screenHeight - 10)
-            } else {
-                ; Bottom-right quadrant
-                waypointX := Random(screenWidth / 2, screenWidth - 10)
-                waypointY := Random(screenHeight / 2, screenHeight - 10)
-            }
+            ; Roam across monitors (avoids "stuck bottom-right" on multi-monitor layouts)
+            monIdx := Random(1, monCount)
+            GetSafeRectForMonitor(monIdx, edgePad, &l2, &t2, &r2, &b2)
+            waypointX := Random(l2, r2)
+            waypointY := Random(t2, b2)
 
             ; Move to waypoint with very smooth, speedy curve
             MouseMoveSmooth(waypointX, waypointY, Random(1, 2))
@@ -574,30 +671,52 @@ RandomScreenMovement() {
             Sleep(Random(20, 50))
         }
 
-        ; Final destination - opposite quadrant from current position
-        if (currentX < screenWidth / 2 && currentY < screenHeight / 2) {
-            newX := Random(screenWidth / 2, screenWidth - 10)
-            newY := Random(screenHeight / 2, screenHeight - 10)
-        } else if (currentX >= screenWidth / 2 && currentY < screenHeight / 2) {
-            newX := Random(10, screenWidth / 2)
-            newY := Random(screenHeight / 2, screenHeight - 10)
-        } else if (currentX < screenWidth / 2 && currentY >= screenHeight / 2) {
-            newX := Random(screenWidth / 2, screenWidth - 10)
-            newY := Random(10, screenHeight / 2)
-        } else {
-            newX := Random(10, screenWidth / 2)
-            newY := Random(10, screenHeight / 2)
+        ; Final destination on a (possibly different) monitor
+        finalMon := (monCount > 1) ? Random(1, monCount) : curMon
+        if (monCount > 1 && finalMon == curMon) {
+            finalMon := Mod(finalMon, monCount) + 1
         }
+        GetSafeRectForMonitor(finalMon, edgePad, &l3, &t3, &r3, &b3)
+        newX := Random(l3, r3)
+        newY := Random(t3, b3)
         MouseMoveSmooth(newX, newY, Random(1, 2))
 
     } else {
         ; 30% - Random oval shape movement - speedy
         ; Use current position as starting point, but move to random center for oval
-        ; Random center position anywhere on entire screen (including edges)
-        centerX := Random(100, screenWidth - 100)
-        centerY := Random(100, screenHeight - 100)
+        ; Pick a monitor for the oval and keep it within its safe rect.
+        monIdx := Random(1, monCount)
+        GetSafeRectForMonitor(monIdx, edgePad, &l4, &t4, &r4, &b4)
+        safeW := Abs(r4 - l4)
+        safeH := Abs(b4 - t4)
+        ; If area is tiny, just do a medium move inside it.
+        if (safeW < 50 || safeH < 50) {
+            centerX := Random(l4, r4)
+            centerY := Random(t4, b4)
+            MouseMoveSmooth(centerX, centerY, Random(1, 2))
+            return
+        }
 
         ; First move smoothly to near the oval center (if far away)
+        ; Choose radius based on monitor size, then pick a center that can fit the oval.
+        maxRX := Max(30, Min(Floor(safeW / 3), 400))
+        maxRY := Max(30, Min(Floor(safeH / 3), 300))
+        radiusX := Random(30, maxRX)
+        radiusY := Random(30, maxRY)
+
+        cxMin := l4 + radiusX
+        cxMax := r4 - radiusX
+        cyMin := t4 + radiusY
+        cyMax := b4 - radiusY
+        if (cxMax < cxMin) {
+            cxMin := l4, cxMax := r4
+        }
+        if (cyMax < cyMin) {
+            cyMin := t4, cyMax := b4
+        }
+        centerX := Random(cxMin, cxMax)
+        centerY := Random(cyMin, cyMax)
+
         distanceToCenter := Sqrt((centerX - currentX) ** 2 + (centerY - currentY) ** 2)
         if (distanceToCenter > 200) {
             ; Move closer to center first
@@ -606,10 +725,6 @@ RandomScreenMovement() {
             MouseMoveSmooth(approachX, approachY, Random(1, 2))
             Sleep(Random(50, 100))
         }
-
-        ; Random oval size (large ovals across screen)
-        radiusX := Random(150, Min(screenWidth / 3, 400))  ; Horizontal radius
-        radiusY := Random(150, Min(screenHeight / 3, 300))  ; Vertical radius
 
         ; Random number of steps for oval (more steps = smoother)
         steps := Random(15, 25)
@@ -636,10 +751,19 @@ RandomScreenMovement() {
 }
 
 PerformMouseMovement() {
-    global lastMousePos, currentActivity
+    global lastMousePos, currentActivity, eventEnabled
+    if (!eventEnabled["MouseMovement"]) {
+        DebugLog("MouseMovement skipped (disabled)", "Sim")
+        return
+    }
+    if (!TryBeginMouseAction()) {
+        DebugLog("MouseMovement skipped (mouse action busy)", "Sim")
+        return
+    }
 
-    MouseGetPos(&currentX, &currentY)
-    lastMousePos := { x: currentX, y: currentY }
+    try {
+        MouseGetPos(&currentX, &currentY)
+        lastMousePos := { x: currentX, y: currentY }
 
     ; Long random movements across entire screen - creates random shapes/paths
     ; Movements cover large screen areas, very speedy, includes random oval shapes
@@ -660,24 +784,28 @@ PerformMouseMovement() {
         currentActivity := "🖱️ Mouse Movement - Oval shape (10-15x at bullet speed)"
     }
 
-    ; Perform long random screen movement (includes oval shapes randomly)
-    RandomScreenMovement()
+        ; Perform long random screen movement (includes oval shapes randomly)
+        RandomScreenMovement()
 
-    ; Very short pause after movement (speedy)
-    Sleep(Random(50, 150))  ; Reduced from 100-300
+        ; Very short pause after movement (speedy)
+        Sleep(Random(50, 150))  ; Reduced from 100-300
 
-    ; Log activity
-    LogActivity("Mouse Movement", "Long random screen movement (speedy)")
+        ; Log activity
+        LogAction("mouse", "mouse moved")
 
-    ; Schedule scroll wheel action after 10 seconds (always after mouse movement)
-    ; Always scrolls - if there's overflowing content, it will scroll automatically
-    SetTimer(() => PerformScrollAfterMouseMove(), -10000)
+        ; Schedule scroll wheel action after 10 seconds (always after mouse movement)
+        ; Always scrolls - if there's overflowing content, it will scroll automatically
+        SetTimer(() => PerformScrollAfterMouseMove(), -10000)
+    } finally {
+        EndMouseAction()
+    }
 }
 
 ; ============================================
 ; BRIGHTNESS & VOLUME CONTROL (LAPTOP HARDWARE)
 ; ============================================
 PerformBrightnessAdjust() {
+    global hardwareAdjustBrightness, hardwareAdjustBrightnessUseFunctionKeys, hardwareAdjustBrightnessUseWmi
     ; Natural brightness adjustment - mimics human behavior
     ; Random direction: 50% increase, 50% decrease (humans adjust both ways)
     direction := Random(1, 2)  ; 1 = up, 2 = down
@@ -685,44 +813,47 @@ PerformBrightnessAdjust() {
     ; Small increments (1-3 steps) - humans don't jump from min to max
     steps := Random(1, 3)
 
-    ; Use brightness keys (works on most laptops)
-    ; Most laptops use Fn+F5/F6 or have dedicated brightness keys
-    ; We'll simulate the brightness key presses directly
+    if (!hardwareAdjustBrightness) {
+        DebugLog("BrightnessAdjust skipped (brightness sub-option disabled)", "Hardware")
+        return
+    }
+
+    usedMethods := []
+
+    ; Use dedicated brightness keys (works on many laptops / Windows devices)
+    if (hardwareAdjustBrightnessUseFunctionKeys) {
+        usedMethods.Push("keys")
     if (direction == 1) {
-        ; Increase brightness
         loop steps {
-            ; Try brightness up key (varies by laptop, but F5 is common)
-            ; Some laptops need Fn key, but we'll try direct F5 first
-            Send("{F5}")
-            Sleep(Random(100, 200))  ; Natural delay between presses
+                Send("{Brightness_Up}")
+                Sleep(Random(100, 200))
         }
     } else {
-        ; Decrease brightness
         loop steps {
-            ; Try brightness down key (F6 is common)
-            Send("{F6}")
+                Send("{Brightness_Down}")
             Sleep(Random(100, 200))
+            }
         }
     }
 
     ; Alternative: Try Windows brightness API if keys don't work
     ; This is a fallback that some systems might support better
+    if (hardwareAdjustBrightnessUseWmi) {
+        usedMethods.Push("wmi")
     try {
-        ; Use PowerShell to adjust brightness (small adjustment)
         brightnessDelta := Random(5, 15)
         if (direction == 1) {
-            ; This is a simplified approach - adjust brightness up
             RunWait(
                 'powershell.exe -WindowStyle Hidden -Command "$m = Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods; $b = (Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness).CurrentBrightness; $m.WmiSetBrightness(1, [Math]::Min(100, $b + ' .
                 brightnessDelta . '))"', , "Hide")
         } else {
-            ; Adjust brightness down
             RunWait(
                 'powershell.exe -WindowStyle Hidden -Command "$m = Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods; $b = (Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness).CurrentBrightness; $m.WmiSetBrightness(1, [Math]::Max(0, $b - ' .
                 brightnessDelta . '))"', , "Hide")
         }
     } catch {
-        ; If API fails, the key presses above should still work
+            DebugLog("BrightnessAdjust WMI failed (ignored)", "Hardware")
+        }
     }
 
     ; Natural pause after adjustment (humans don't adjust instantly)
@@ -730,21 +861,58 @@ PerformBrightnessAdjust() {
 
     ; Log activity
     LogActivity("Brightness Adjust", direction == 1 ? "Increase" : "Decrease")
+    DebugLog("BrightnessAdjust done dir=" . (direction == 1 ? "up" : "down") . " methods=" . (usedMethods.Length ? JoinStrings(", ", usedMethods*) : "none"), "Hardware")
 }
 
 PerformVolumeAdjust() {
+    global hardwareAdjustVolume, hardwareAdjustVolumeUp, hardwareAdjustVolumeDown, hardwareAdjustVolumeAllowMute
     ; Natural volume adjustment - mimics human behavior
-    ; Random direction: 60% increase, 30% decrease, 10% mute toggle
-    action := Random(1, 10)
+    if (!hardwareAdjustVolume) {
+        DebugLog("VolumeAdjust skipped (volume sub-option disabled)", "Hardware")
+        return
+    }
 
-    if (action <= 6) {
+    options := []
+    if (hardwareAdjustVolumeUp) {
+        options.Push("Up")
+    }
+    if (hardwareAdjustVolumeDown) {
+        options.Push("Down")
+    }
+    if (hardwareAdjustVolumeAllowMute) {
+        options.Push("Mute")
+    }
+    if (options.Length == 0) {
+        DebugLog("VolumeAdjust skipped (no volume options enabled)", "Hardware")
+        return
+    }
+
+    ; Weighted pick (Up more common)
+    roll := Random(1, 100)
+    if (options.Length == 1) {
+        choice := options[1]
+    } else {
+        choice := ""
+        if (hardwareAdjustVolumeUp && roll <= 60) {
+            choice := "Up"
+        } else if (hardwareAdjustVolumeDown && roll <= 90) {
+            choice := "Down"
+        } else if (hardwareAdjustVolumeAllowMute) {
+            choice := "Mute"
+        } else {
+            ; fallback to any enabled option
+            choice := options[Random(1, options.Length)]
+        }
+    }
+
+    if (choice == "Up") {
         ; Increase volume (60% - humans often turn up volume)
         steps := Random(1, 4)  ; 1-4 steps up
         loop steps {
             Send("{Volume_Up}")
             Sleep(Random(80, 180))  ; Natural delay
         }
-    } else if (action <= 9) {
+    } else if (choice == "Down") {
         ; Decrease volume (30% - less common)
         steps := Random(1, 3)  ; 1-3 steps down
         loop steps {
@@ -752,7 +920,7 @@ PerformVolumeAdjust() {
             Sleep(Random(80, 180))
         }
     } else {
-        ; Mute toggle (10% - occasional mute/unmute)
+        ; Mute toggle (occasional mute/unmute)
         Send("{Volume_Mute}")
         Sleep(Random(500, 1500))  ; Stay muted briefly
         ; 70% chance to unmute after a moment
@@ -766,26 +934,47 @@ PerformVolumeAdjust() {
     Sleep(Random(200, 600))
 
     ; Log activity
-    if (action <= 6) {
+    if (choice == "Up") {
         LogActivity("Volume Adjust", "Increase")
-    } else if (action <= 9) {
+    } else if (choice == "Down") {
         LogActivity("Volume Adjust", "Decrease")
     } else {
         LogActivity("Volume Adjust", "Mute Toggle")
     }
+    DebugLog("VolumeAdjust done mode=" . StrLower(choice), "Hardware")
 }
 
 PerformHardwareAdjust() {
     global currentActivity
+    global hardwareAdjustBrightness, hardwareAdjustBrightnessUseFunctionKeys, hardwareAdjustBrightnessUseWmi
+    global hardwareAdjustVolume, hardwareAdjustVolumeUp, hardwareAdjustVolumeDown, hardwareAdjustVolumeAllowMute
     ; Natural hardware adjustment - brightness and/or volume
     ; 50% chance to adjust brightness, 50% chance for volume
     ; 20% chance to adjust both (humans sometimes adjust multiple things)
 
-    adjustBoth := (Random(1, 10) <= 2)
+    ; If user disabled everything, do nothing (and log debug if enabled).
+    if (!hardwareAdjustBrightness && !hardwareAdjustVolume) {
+        DebugLog("HardwareAdjust skipped (no sub-options enabled)", "Hardware")
+        return
+    }
+    ; If brightness is enabled but no method is enabled, brightness cannot run.
+    canDoBrightness := hardwareAdjustBrightness && (hardwareAdjustBrightnessUseFunctionKeys || hardwareAdjustBrightnessUseWmi)
+    canDoVolume := hardwareAdjustVolume && (hardwareAdjustVolumeUp || hardwareAdjustVolumeDown || hardwareAdjustVolumeAllowMute)
+    if (!canDoBrightness && !canDoVolume) {
+        DebugLog("HardwareAdjust skipped (brightness has no method; volume disabled)", "Hardware")
+        return
+    }
+
+    adjustBoth := (Random(1, 10) <= 2) && canDoBrightness && canDoVolume
     if (adjustBoth) {
         currentActivity := "⚙️ Hardware Adjust - Brightness & Volume"
     } else {
-        if (Random(1, 2) == 1) {
+        if (canDoBrightness && canDoVolume) {
+            pickBrightness := (Random(1, 2) == 1)
+        } else {
+            pickBrightness := canDoBrightness
+        }
+        if (pickBrightness) {
             currentActivity := "⚙️ Hardware Adjust - Brightness"
         } else {
             currentActivity := "⚙️ Hardware Adjust - Volume"
@@ -806,12 +995,13 @@ PerformHardwareAdjust() {
         }
     } else {
         ; Adjust one or the other (80%)
-        if (Random(1, 2) == 1) {
+        if (InStr(currentActivity, "Brightness")) {
             PerformBrightnessAdjust()
         } else {
             PerformVolumeAdjust()
         }
     }
+    DebugLog("HardwareAdjust done (brightness=" . (canDoBrightness ? "on" : "off") . ", volume=" . (canDoVolume ? "on" : "off") . ", mute=" . (hardwareAdjustVolumeAllowMute ? "on" : "off") . ")", "Hardware")
 }
 
 ; ============================================
@@ -864,62 +1054,32 @@ IsScrollableAtMouse() {
 
 ; Perform scroll after mouse movement (scheduled 10 seconds after mouse move)
 PerformScrollAfterMouseMove() {
-    global simulationActive, pausedByUser
+    global simulationActive, pausedByUser, eventEnabled, scrollAllowUp, scrollAllowDown
 
     ; Don't scroll if simulation is paused or not active
     if (!simulationActive || pausedByUser) {
         return
     }
 
-    ; Get current mouse position (scroll happens at current location)
-    MouseGetPos(&currentX, &currentY)
-
-    ; Always scroll - if there's overflowing content, it will scroll; if not, nothing happens
-    ; Random scroll direction: 50% up, 50% down
-    scrollDirection := Random(1, 2) == 1 ? "WheelUp" : "WheelDown"
-
-    ; Random scroll amount (4-19 clicks) - more than 3, less than 20
-    scrollAmount := Random(4, 19)
-
-    ; Perform scroll at current mouse position
-    ; Always send scroll events - they'll work if there's scrollable content
-    loop scrollAmount {
-        ; Send scroll wheel event (up or down)
-        ; This will scroll any overflowing content up or down automatically
-        Send("{" . scrollDirection . "}")
-
-        ; Natural delay between scroll clicks (80-200ms)
-        ; Humans don't scroll instantly - there's a slight delay
-        Sleep(Random(80, 200))
-    }
-
-    ; Log activity
-    LogActivity("Scroll Wheel", scrollAmount . " " . (scrollDirection == "WheelUp" ? "up" : "down") . " at (" .
-    currentX . "," . currentY . ")")
-}
-
-; Standalone scroll wheel function for random actions (30% ratio)
-PerformScrollWheel() {
-    global simulationActive, pausedByUser, scrollAllowUp, scrollAllowDown
-
-    ; Don't scroll if simulation is paused or not active
-    if (!simulationActive || pausedByUser) {
+    ; Respect Event Settings (this used to ignore the toggle)
+    if (!eventEnabled["ScrollWheel"]) {
+        DebugLog("ScrollAfterMouseMove skipped (ScrollWheel disabled)", "Sim")
         return
     }
-
-    ; If both directions disabled, do nothing
     if (!scrollAllowUp && !scrollAllowDown) {
-        LogActivity("Scroll Wheel", "Skipped (both directions disabled)")
+        DebugLog("ScrollAfterMouseMove skipped (both directions disabled)", "Sim")
         return
     }
+
+    ; This is script-generated input (timer fired after mouse move) — prevent self-pause.
+    BeginScriptInputWindow(1200)
 
     ; Get current mouse position (scroll happens at current location)
     MouseGetPos(&currentX, &currentY)
 
-    ; Always scroll - if there's overflowing content, it will scroll; if not, nothing happens
     ; Scroll direction depends on settings
     if (scrollAllowUp && scrollAllowDown) {
-        scrollDirection := Random(1, 2) == 1 ? "WheelUp" : "WheelDown"
+    scrollDirection := Random(1, 2) == 1 ? "WheelUp" : "WheelDown"
     } else if (scrollAllowUp) {
         scrollDirection := "WheelUp"
     } else {
@@ -942,8 +1102,58 @@ PerformScrollWheel() {
     }
 
     ; Log activity
-    LogActivity("Scroll Wheel", scrollAmount . " " . (scrollDirection == "WheelUp" ? "up" : "down") . " at (" .
-    currentX . "," . currentY . ")")
+    LogAction("mouse", "scrolled " . (scrollDirection == "WheelUp" ? "up" : "down") . " (" . scrollAmount . ") at (" . currentX . "," . currentY . ")")
+}
+
+; Standalone scroll wheel function for random actions (30% ratio)
+PerformScrollWheel() {
+    global simulationActive, pausedByUser, scrollAllowUp, scrollAllowDown, eventEnabled
+
+    ; Don't scroll if simulation is paused or not active
+    if (!simulationActive || pausedByUser) {
+        return
+    }
+    if (!eventEnabled["ScrollWheel"]) {
+        DebugLog("ScrollWheel skipped (disabled)", "Sim")
+        return
+    }
+
+    ; If both directions disabled, do nothing
+    if (!scrollAllowUp && !scrollAllowDown) {
+        LogAction("mouse", "scroll skipped (both directions disabled)")
+        return
+    }
+
+    ; Get current mouse position (scroll happens at current location)
+    MouseGetPos(&currentX, &currentY)
+
+    ; Always scroll - if there's overflowing content, it will scroll; if not, nothing happens
+    ; Scroll direction depends on settings
+    if (scrollAllowUp && scrollAllowDown) {
+    scrollDirection := Random(1, 2) == 1 ? "WheelUp" : "WheelDown"
+    } else if (scrollAllowUp) {
+        scrollDirection := "WheelUp"
+    } else {
+        scrollDirection := "WheelDown"
+    }
+
+    ; Random scroll amount (4-19 clicks) - more than 3, less than 20
+    scrollAmount := Random(4, 19)
+
+    ; Perform scroll at current mouse position
+    ; Always send scroll events - they'll work if there's scrollable content
+    loop scrollAmount {
+        ; Send scroll wheel event (up or down)
+        ; This will scroll any overflowing content up or down automatically
+        Send("{" . scrollDirection . "}")
+
+        ; Natural delay between scroll clicks (80-200ms)
+        ; Humans don't scroll instantly - there's a slight delay
+        Sleep(Random(80, 200))
+    }
+
+    ; Log activity
+    LogAction("mouse", "scrolled " . (scrollDirection == "WheelUp" ? "up" : "down") . " (" . scrollAmount . ") at (" . currentX . "," . currentY . ")")
 }
 
 ; ============================================
@@ -982,24 +1192,137 @@ ClampPointToMonitor(x, y, &outX, &outY, padding := 0) {
     outY := Min(Max(y, t + padding), b - padding)
 }
 
-GetRandomizedClickPoint(baseX, baseY, rangePx, &outX, &outY) {
-    ; Randomize within a square (±rangePx), with edge-aware direction bias.
-    GetMonitorRectFromPoint(baseX, baseY, &l, &t, &r, &b, &monIdx)
+GetSafeRectForMonitor(monIdx, padPx, &outL, &outT, &outR, &outB) {
+    MonitorGet(monIdx, &l, &t, &r, &b)
+    pad := Max(0, Integer(padPx))
+    outL := l + pad
+    outT := t + pad
+    outR := r - pad
+    outB := b - pad
+    ; If padding collapses the rect (tiny monitor), fall back to 0 padding.
+    if (outR <= outL) {
+        outL := l
+        outR := r
+    }
+    if (outB <= outT) {
+        outT := t
+        outB := b
+    }
+}
 
-    if (baseX <= l + rangePx) {
-        dx := Random(0, rangePx)
-    } else if (baseX >= r - rangePx) {
-        dx := Random(-rangePx, 0)
-    } else {
-        dx := Random(-rangePx, rangePx)
+HasClickTargetPos() {
+    global mouseClickTargetPos
+    if (mouseClickTargetPos == 0) {
+        return false
+    }
+    if (!IsObject(mouseClickTargetPos)) {
+        return false
+    }
+    ; New format (monitor-relative)
+    if (mouseClickTargetPos.HasProp("mon") && mouseClickTargetPos.HasProp("relX") && mouseClickTargetPos.HasProp("relY")) {
+        return true
+    }
+    ; Back-compat: old format (absolute screen)
+    if (mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y")) {
+        return true
+    }
+    return false
+}
+
+GetClickTargetScreenPoint(&outX, &outY, &outMon := 0, &outRelX := 0, &outRelY := 0) {
+    global mouseClickTargetPos
+    if (!HasClickTargetPos()) {
+        outX := 0, outY := 0, outMon := 0, outRelX := 0, outRelY := 0
+        return false
     }
 
-    if (baseY <= t + rangePx) {
-        dy := Random(0, rangePx)
-    } else if (baseY >= b - rangePx) {
-        dy := Random(-rangePx, 0)
+    ; If old format, convert using the current monitor for that point.
+    if (mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y")) {
+        ax := mouseClickTargetPos.x
+        ay := mouseClickTargetPos.y
+        GetMonitorRectFromPoint(ax, ay, &l, &t, &r, &b, &monIdx)
+        relX := ax - l
+        relY := ay - t
+        mouseClickTargetPos := { mon: monIdx, relX: relX, relY: relY }
+    }
+
+    monIdx := mouseClickTargetPos.mon
+    relX := mouseClickTargetPos.relX
+    relY := mouseClickTargetPos.relY
+
+    ; If monitor index is out of range (monitor layout changed), fall back to primary.
+    monCount := MonitorGetCount()
+    if (monIdx < 1 || monIdx > monCount) {
+        monIdx := MonitorGetPrimary()
+    }
+
+    MonitorGet(monIdx, &l, &t, &r, &b)
+    ax := l + relX
+    ay := t + relY
+    ClampPointToMonitor(ax, ay, &ax, &ay, 0)
+
+    outX := ax, outY := ay, outMon := monIdx, outRelX := relX, outRelY := relY
+    return true
+}
+
+GetClickTargetDisplayText() {
+    ok := GetClickTargetScreenPoint(&ax, &ay, &monIdx, &relX, &relY)
+    if (!ok) {
+        return "No target position set"
+    }
+    return "Monitor " . monIdx . " - Position: (" . relX . ", " . relY . ")"
+}
+
+GetMaxTargetJitterPx() {
+    ; Max = half of the monitor size (use target monitor if set, else primary).
+    if (HasClickTargetPos()) {
+        GetClickTargetScreenPoint(&ax, &ay, &monIdx, &relX, &relY)
     } else {
-        dy := Random(-rangePx, rangePx)
+        monIdx := MonitorGetPrimary()
+    }
+    MonitorGet(monIdx, &l, &t, &r, &b)
+    w := Abs(r - l)
+    h := Abs(b - t)
+    return Floor(Min(w, h) / 2)
+}
+
+GetRandomizedClickPoint(baseX, baseY, rangePx, &outX, &outY) {
+    ; Randomize around target within a square (±rangePx).
+    ; Use a center-weighted distribution (Gaussian) so most clicks are near the target center.
+    GetMonitorRectFromPoint(baseX, baseY, &l, &t, &r, &b, &monIdx)
+    rangePx := Max(1, Integer(rangePx))
+
+    ; StdDev chosen so ~95% falls within rangePx (roughly range/2)
+    std := Max(1.0, rangePx / 2.0)
+
+    ; Edge-aware sign bias near boundaries
+    xSign := 0
+    if (baseX <= l + rangePx) {
+        xSign := 1
+    } else if (baseX >= r - rangePx) {
+        xSign := -1
+    }
+    ySign := 0
+    if (baseY <= t + rangePx) {
+        ySign := 1
+    } else if (baseY >= b - rangePx) {
+        ySign := -1
+    }
+
+    dx := Round(RandGaussian(0, std))
+    dy := Round(RandGaussian(0, std))
+    dx := Min(Max(dx, -rangePx), rangePx)
+    dy := Min(Max(dy, -rangePx), rangePx)
+
+    if (xSign == 1 && dx < 0) {
+        dx := Abs(dx)
+    } else if (xSign == -1 && dx > 0) {
+        dx := -Abs(dx)
+    }
+    if (ySign == 1 && dy < 0) {
+        dy := Abs(dy)
+    } else if (ySign == -1 && dy > 0) {
+        dy := -Abs(dy)
     }
 
     outX := baseX + dx
@@ -1029,6 +1352,7 @@ ShowClickTargetPreviewSquare(baseX, baseY, rangePx := 5, ms := 1500) {
 UpdateClickSchedulerState() {
     global clickWindowStartTick, clicksThisWindowLimit, clicksThisWindowDone, nextTargetClickAt
     global mouseClicksMaxPerMinute
+    global clickSessionActiveUntil
 
     now := A_TickCount
     if (clickWindowStartTick == 0 || now - clickWindowStartTick >= 60000) {
@@ -1037,6 +1361,12 @@ UpdateClickSchedulerState() {
         clicksThisWindowLimit := Random(1, maxVal)
         clicksThisWindowDone := 0
         nextTargetClickAt := 0
+    }
+
+    ; If we're in a short "click session", timing is handled by the scheduler tick
+    ; (so clicks don't run constantly in the background).
+    if (clickSessionActiveUntil > now) {
+        return
     }
 
     if (nextTargetClickAt == 0 && clicksThisWindowDone < clicksThisWindowLimit) {
@@ -1054,6 +1384,9 @@ UpdateClickSchedulerState() {
 MouseClickSchedulerTick(*) {
     global simulationActive, pausedByUser, eventEnabled, mouseClickTargetPos
     global clicksThisWindowDone, clicksThisWindowLimit, nextTargetClickAt
+    global mouseClickHoldMaxMs
+    global clickTargetJitterPx
+    global clickSessionActiveUntil, clickSessionRemaining
 
     if (!simulationActive || pausedByUser) {
         return
@@ -1061,33 +1394,79 @@ MouseClickSchedulerTick(*) {
     if (!eventEnabled["MouseClicks"]) {
         return
     }
-    if (mouseClickTargetPos == 0 || !mouseClickTargetPos.HasProp("x") || !mouseClickTargetPos.HasProp("y")) {
+    if (!HasClickTargetPos()) {
+        return
+    }
+
+    now := A_TickCount
+    ; Only click during an active click session (MouseClicks event was chosen).
+    if (clickSessionActiveUntil == 0 || now > clickSessionActiveUntil || clickSessionRemaining <= 0) {
+        clickSessionActiveUntil := 0
+        clickSessionRemaining := 0
+        StopClickScheduler()
         return
     }
 
     UpdateClickSchedulerState()
-
-    now := A_TickCount
     if (clicksThisWindowDone >= clicksThisWindowLimit) {
+        clickSessionRemaining := 0
+        clickSessionActiveUntil := 0
+        StopClickScheduler()
         return
     }
-    if (nextTargetClickAt == 0 || now < nextTargetClickAt) {
+    ; Session timing: short random spacing between clicks.
+    if (nextTargetClickAt == 0) {
+        nextTargetClickAt := now
+    }
+    if (now < nextTargetClickAt) {
         return
     }
 
-    baseX := mouseClickTargetPos.x
-    baseY := mouseClickTargetPos.y
-    GetRandomizedClickPoint(baseX, baseY, 5, &cx, &cy)
+    ; Don't click while a mouse movement/click action is already in progress.
+    if (!TryBeginMouseAction()) {
+        return
+    }
 
+    GetClickTargetScreenPoint(&baseX, &baseY, &monIdx, &relX, &relY)
+    jitter := Max(1, Integer(clickTargetJitterPx))
+    GetRandomizedClickPoint(baseX, baseY, jitter, &cx, &cy)
+
+    ; Always return cursor after scheduler click, even if something fails mid-way.
+    GetCursorPosScreen(&origX, &origY)
     try {
-        MouseMove(cx, cy, 0)
-        Click()
+        ; This is script-generated input (scheduler tick) — prevent self-pause.
+        BeginScriptInputWindow(1500)
+
+        ; Move to target, click.
+        MouseMoveSmooth(cx, cy, Random(1, 2))
+        Click("Down")
+        Sleep(Random(20, Max(20, mouseClickHoldMaxMs)))
+        Click("Up")
+
         clicksThisWindowDone += 1
-        nextTargetClickAt := 0
-        UpdateClickSchedulerState()
-        LogActivity("Mouse Click", "Target click (" . clicksThisWindowDone . "/" . clicksThisWindowLimit . ") at (" . cx . "," . cy . ")")
+        clickSessionRemaining -= 1
+        nextTargetClickAt := now + Random(250, 1200)
+        LogAction("mouse", "left button clicked at (" . cx . "," . cy . ") (target; base=(" . baseX . "," . baseY . "); jitter=±" . jitter . "px)")
+        DebugLog("ClickScheduler clicked at (" . cx . "," . cy . ") window=" . clicksThisWindowDone . "/" . clicksThisWindowLimit, "Click")
     } catch {
         ; ignore click failures
+    } finally {
+        try {
+            ; Return cursor (small jitter so it doesn't look robotic), and clamp to monitor bounds.
+            backX := origX + Random(-2, 2)
+            backY := origY + Random(-2, 2)
+            ClampPointToMonitor(backX, backY, &backX, &backY, 2)
+            MouseMoveSmooth(backX, backY, Random(1, 2))
+        } catch {
+            ; ignore return failures
+        }
+        EndMouseAction()
+        ; Session ended? stop the scheduler to avoid background clicks.
+        if (clickSessionRemaining <= 0 || A_TickCount > clickSessionActiveUntil) {
+            clickSessionActiveUntil := 0
+            clickSessionRemaining := 0
+            StopClickScheduler()
+        }
     }
 }
 
@@ -1101,10 +1480,45 @@ EnsureClickSchedulerRunning() {
 
 StopClickScheduler() {
     global clickSchedulerRunning
+    global clickSessionActiveUntil, clickSessionRemaining
     if (clickSchedulerRunning) {
         SetTimer(MouseClickSchedulerTick, 0)
         clickSchedulerRunning := false
     }
+    clickSessionActiveUntil := 0
+    clickSessionRemaining := 0
+}
+
+StartClickSession() {
+    global simulationActive, pausedByUser, eventEnabled
+    global clickSessionActiveUntil, clickSessionRemaining, nextTargetClickAt
+    global clicksThisWindowDone, clicksThisWindowLimit
+
+    if (!simulationActive || pausedByUser) {
+        return false
+    }
+    if (!eventEnabled["MouseClicks"]) {
+        return false
+    }
+    if (!HasClickTargetPos()) {
+        return false
+    }
+
+    ; Ensure per-minute window is initialized, but don't let it schedule long delays.
+    UpdateClickSchedulerState()
+    remaining := clicksThisWindowLimit - clicksThisWindowDone
+    if (remaining <= 0) {
+        return false
+    }
+
+    ; Short session: 1-5 clicks (bounded by remaining quota)
+    maxBurst := Min(5, remaining)
+    clickSessionRemaining := Random(1, maxBurst)
+    clickSessionActiveUntil := A_TickCount + Random(2500, 7000)
+    nextTargetClickAt := 0  ; click soon
+    EnsureClickSchedulerRunning()
+    DebugLog("ClickSession started (remaining=" . clickSessionRemaining . ", until=" . clickSessionActiveUntil . ")", "Click")
+    return true
 }
 
 ShowAlwaysOnTopMessageForWindow(ownerWinTitle, message, title) {
@@ -1201,6 +1615,7 @@ IsInContentArea(mouseX, mouseY) {
 ; Uses only ToolTip (no blocking popup), so clicks are captured on the actual target window.
 PickMouseClickTargetPosition(sourceLabel := "", ownerWinTitle := "") {
     global mouseClickTargetPos
+    global clickTargetJitterPx
 
     ; Avoid capturing the click that triggered the picker button/hotkey
     Sleep(250)
@@ -1213,8 +1628,8 @@ PickMouseClickTargetPosition(sourceLabel := "", ownerWinTitle := "") {
         ; Cancel
         if GetKeyState("Esc", "P") {
             ToolTip()
-            return false
-        }
+        return false
+    }
 
         GetCursorPosScreen(&x, &y)
         GetMonitorRectFromPoint(x, y, &l, &t, &r, &b, &monIdx)
@@ -1238,18 +1653,22 @@ PickMouseClickTargetPosition(sourceLabel := "", ownerWinTitle := "") {
 
             ; Always allow edge positions. Only clamp to the monitor bounds to avoid out-of-range values.
             ClampPointToMonitor(finalX, finalY, &finalX, &finalY, 0)
-            mouseClickTargetPos := { x: finalX, y: finalY }
+            GetMonitorRectFromPoint(finalX, finalY, &l2, &t2, &r2, &b2, &mon2)
+            relX2 := finalX - l2
+            relY2 := finalY - t2
+            mouseClickTargetPos := { mon: mon2, relX: relX2, relY: relY2 }
             ToolTip()
             UpdateSettingsWindowTargetPosition()
-            LogActivity("Mouse Click Target", "Set to (" . finalX . ", " . finalY . ")" . (sourceLabel != "" ? " - " . sourceLabel : ""))
-            ShowClickTargetPreviewSquare(finalX, finalY, 5, 2000)
+            LogActivity("Mouse Click Target", "Set to monitor " . mon2 . " (" . relX2 . ", " . relY2 . ")" . (sourceLabel != "" ? " - " . sourceLabel : ""))
+            jitter := Max(1, Integer(clickTargetJitterPx))
+            ShowClickTargetPreviewSquare(finalX, finalY, jitter, 2000)
             ; If ownerWinTitle is provided, treat it as owner for stacking; otherwise show standalone.
             ownerHwnd := 0
             if (ownerWinTitle != "") {
                 try ownerHwnd := WinExist(ownerWinTitle)
             }
-            ShowOwnedPopup(ownerHwnd, "✓ Mouse click target position set!`n`nPosition: (" . finalX . ", " . finalY . ")", "Target Position Set")
-            return true
+            ShowOwnedPopup(ownerHwnd, "✓ Mouse click target position set!`n`nMonitor " . mon2 . " position: (" . relX2 . ", " . relY2 . ")`nScreen: (" . finalX . ", " . finalY . ")", "Target Position Set")
+    return true
         }
 
         lastDown := isDown
@@ -1261,19 +1680,29 @@ PickMouseClickTargetPosition(sourceLabel := "", ownerWinTitle := "") {
 ; Only clicks if mouse is in content area (not taskbar or menu bar)
 ; Uses pre-selected target position if set, otherwise uses current mouse position
 PerformMouseClicks() {
-    global simulationActive, pausedByUser, currentActivity, mouseClickTargetPos
+    global simulationActive, pausedByUser, currentActivity, mouseClickTargetPos, eventEnabled
+    global mouseClickHoldMaxMs
 
     ; Don't click if simulation is paused or not active
     if (!simulationActive || pausedByUser) {
         return
     }
-
-    ; New behavior: target clicks are handled by scheduler (max per minute + jitter).
-    ; If a target is set and MouseClicks is enabled, ensure scheduler is running and return.
-    if (mouseClickTargetPos != 0 && mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y")) {
-        EnsureClickSchedulerRunning()
+    if (!eventEnabled["MouseClicks"]) {
+        DebugLog("MouseClicks skipped (disabled)", "Sim")
         return
     }
+    if (!TryBeginMouseAction()) {
+        DebugLog("MouseClicks skipped (mouse action busy)", "Sim")
+        return
+    }
+
+    try {
+        ; New behavior: target clicks are handled by scheduler (max per minute + jitter).
+        ; If a target is set, start a SHORT click session (only when MouseClicks event is chosen).
+        if (HasClickTargetPos()) {
+            StartClickSession()
+            return
+        }
 
     ; Determine target position
     targetX := 0
@@ -1281,10 +1710,9 @@ PerformMouseClicks() {
     useTargetPos := false
 
     ; Check if user has set a target position
-    if (mouseClickTargetPos != 0 && mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y")) {
-        ; Use pre-selected target position
-        targetX := mouseClickTargetPos.x
-        targetY := mouseClickTargetPos.y
+    if (HasClickTargetPos()) {
+        ; Use pre-selected target position (monitor-relative)
+        GetClickTargetScreenPoint(&targetX, &targetY, &monIdx, &relX, &relY)
         useTargetPos := true
         ; Always allow the user-chosen target. Clamp to monitor bounds for safety.
         ClampPointToMonitor(targetX, targetY, &targetX, &targetY, 0)
@@ -1320,7 +1748,7 @@ PerformMouseClicks() {
         ; Double-check we're in content area after movement
         if (!IsInContentArea(targetX, targetY)) {
             ; Still not in content area - skip clicking
-            LogActivity("Mouse Click", "Skipped - mouse not in content area")
+            LogAction("mouse", "click skipped (mouse not in content area)")
             return
         }
     } else if (useTargetPos) {
@@ -1353,9 +1781,11 @@ PerformMouseClicks() {
     ; Perform clicks
     currentActivity := "🖱️ Mouse Click - " . clickCount . " left-clicks in content area"
 
-    loop clickCount {
+        loop clickCount {
         ; Perform left-click at current position
-        Click()
+        Click("Down")
+        Sleep(Random(20, Max(20, mouseClickHoldMaxMs)))
+        Click("Up")
 
         ; Natural delay between clicks (with small random variation)
         if (A_Index < clickCount) {
@@ -1370,15 +1800,21 @@ PerformMouseClicks() {
 
     ; Log activity
     positionSource := useTargetPos ? " (target position)" : " (current position)"
-    LogActivity("Mouse Click", clickCount . " left-clicks at (" . currentX . "," . currentY . ")" . positionSource .
-        " in " . Round(totalDuration) . "ms")
+        LogAction("mouse", "left-clicked (" . clickCount . " clicks) at (" . currentX . "," . currentY . ")" . positionSource)
+    } finally {
+        EndMouseAction()
+    }
 }
 
 ; ============================================
 ; WINDOW SWITCHING (ALT+TAB)
 ; ============================================
 PerformWindowSwitch() {
-    global currentActivity
+    global currentActivity, eventEnabled
+    if (!eventEnabled["WindowSwitch"]) {
+        DebugLog("WindowSwitch skipped (disabled)", "Sim")
+        return
+    }
     ; Simulate Alt+Tab window switching (very human-like behavior)
     ; Random number of tab presses (1-3) to switch between windows
     tabCount := Random(1, 3)
@@ -1411,14 +1847,18 @@ PerformWindowSwitch() {
     }
 
     ; Log activity
-    LogActivity("Window Switch", tabCount . " tabs")
+    LogAction("keyboard", "window changed (Alt+Tab) x" . tabCount)
 }
 
 ; ============================================
 ; TAB SWITCHING (CTRL+TAB)
 ; ============================================
 PerformTabSwitch() {
-    global currentActivity
+    global currentActivity, eventEnabled
+    if (!eventEnabled["TabSwitch"]) {
+        DebugLog("TabSwitch skipped (disabled)", "Sim")
+        return
+    }
     ; Simulate Ctrl+Tab tab switching (browser/editor style)
     tabCount := Random(1, 3)
     currentActivity := "🗂️ Tab Switch - Ctrl+Tab (" . tabCount . " tabs)"
@@ -1431,14 +1871,18 @@ PerformTabSwitch() {
     }
     Send("{Ctrl up}")
 
-    LogActivity("Tab Switch", tabCount . " tabs (Ctrl+Tab)")
+    LogAction("keyboard", "tab switched (Ctrl+Tab) x" . tabCount)
 }
 
 ; ============================================
 ; RANDOM KEY PRESSES
 ; ============================================
 PerformKeyPresses() {
-    global keyList, lastKey, currentActivity, keyPressActions
+    global keyList, lastKey, currentActivity, keyPressActions, eventEnabled
+    if (!eventEnabled["KeyPresses"]) {
+        DebugLog("KeyPresses skipped (disabled)", "Sim")
+        return
+    }
 
     ; Build allowed actions from settings
     actions := []
@@ -1456,6 +1900,7 @@ PerformKeyPresses() {
     seqLen := Random(2, 5)
     currentActivity := "⌨️ Key Press - Sending " . seqLen . " key actions"
 
+    picked := []
     loop seqLen {
         ; Markov chain: avoid adjacent repeats
         if (lastKey != "" && Random(1, 10) <= 7) {
@@ -1466,11 +1911,12 @@ PerformKeyPresses() {
                 }
             }
             action := (filtered.Length > 0) ? filtered[Random(1, filtered.Length)] : actions[Random(1, actions.Length)]
-        } else {
+            } else {
             action := actions[Random(1, actions.Length)]
         }
 
         lastKey := action
+        picked.Push(action)
 
         if (action == "Tab") {
             Send("{Tab}")
@@ -1483,17 +1929,27 @@ PerformKeyPresses() {
                 Sleep(Random(80, 160))
                 Send("{ScrollLock}")
             }
+        } else if (action == "CapsLock") {
+            ; Always double-press (like Scroll Lock style), with a fixed 50ms gap
+            Send("{CapsLock}")
+            Sleep(50)
+            Send("{CapsLock}")
+        } else if (action == "NumLock") {
+            ; Always double-press (like Scroll Lock style), with a fixed 50ms gap
+            Send("{NumLock}")
+            Sleep(50)
+            Send("{NumLock}")
         } else {
             ; Modifier key press (Ctrl/Alt/Shift) - safe when pressed alone
             key := action
-            if (Random(1, 10) == 1) {
-                Send("{" . key . " down}")
-                Sleep(Random(200, 500))
-                Send("{" . key . " up}")
-            } else {
-                Send("{" . key . " down}")
+        if (Random(1, 10) == 1) {
+            Send("{" . key . " down}")
+            Sleep(Random(200, 500))
+            Send("{" . key . " up}")
+        } else {
+            Send("{" . key . " down}")
                 Sleep(Random(50, 150))
-                Send("{" . key . " up}")
+            Send("{" . key . " up}")
             }
         }
 
@@ -1507,8 +1963,8 @@ PerformKeyPresses() {
         }
     }
 
-    ; Log activity after sequence completes
-    LogActivity("Key Press", seqLen . " key actions")
+    ; Log activity after sequence completes (human-readable)
+    LogAction("keyboard", "key pressed: " . JoinStrings(", ", picked*))
 }
 
 ; ============================================
@@ -1517,27 +1973,10 @@ PerformKeyPresses() {
 SimulateHuman() {
     global simulationActive, pausedByUser, scriptActionInProgress
     global scriptActionStartTime, scriptActionEndTime, eventEnabled
-    global mouseMovementMaxIntervalSec, scrollAllowUp, scrollAllowDown
-    global nextMouseMoveDueTick
+    global scrollAllowUp, scrollAllowDown
 
     if (!simulationActive || pausedByUser) {
         return
-    }
-
-    ; Enforce maximum interval for mouse movement (random delay <= max, min 0.1s)
-    if (!IsSet(nextMouseMoveDueTick)) {
-        nextMouseMoveDueTick := 0
-    }
-    forceMouseMove := false
-    if (eventEnabled["MouseMovement"]) {
-        maxMs := Max(100, Round(mouseMovementMaxIntervalSec * 1000))
-        if (nextMouseMoveDueTick == 0) {
-            nextMouseMoveDueTick := A_TickCount + Random(100, maxMs)
-        } else if (A_TickCount >= nextMouseMoveDueTick) {
-            forceMouseMove := true
-        }
-    } else {
-        nextMouseMoveDueTick := 0
     }
 
     ; Mark script action start time (for distinguishing script vs human input)
@@ -1578,10 +2017,6 @@ SimulateHuman() {
         return
     }
 
-    if (forceMouseMove) {
-        selectedEvent := "MouseMovement"
-        randAction := 1  ; treat as mouse movement for timing logic below
-    } else {
     ; Calculate total weight and select from enabled events
     totalWeight := 0
     for event in enabledEvents {
@@ -1604,10 +2039,9 @@ SimulateHuman() {
         }
         cumulativeWeight += eventWeight
     }
-    }
-
     ; Log simulation start
     LogActivity("Simulation", "Action triggered")
+    DebugLog("SelectedEvent=" . selectedEvent . " randAction=" . randAction . " enabledCount=" . enabledEvents.Length, "Sim")
 
     ; Execute selected event
     if (selectedEvent == "MouseMovement") {
@@ -1615,13 +2049,6 @@ SimulateHuman() {
         currentActivity := "🖱️ Mouse Movement - Random paths & oval shapes"
         PerformMouseMovement()
         currentActivity := "✅ Mouse Movement Complete (scroll scheduled in 10s)"
-        ; schedule next due mouse move
-        if (eventEnabled["MouseMovement"]) {
-            maxMs := Max(100, Round(mouseMovementMaxIntervalSec * 1000))
-            nextMouseMoveDueTick := A_TickCount + Random(100, maxMs)
-        } else {
-            nextMouseMoveDueTick := 0
-        }
     } else if (selectedEvent == "ScrollWheel") {
         ; Scroll wheel (25%) - standalone scroll action
         currentActivity := "🖱️ Mouse Scroll - Random scroll up/down"
@@ -1653,6 +2080,8 @@ SimulateHuman() {
         PerformHardwareAdjust()
         currentActivity := "✅ Hardware Adjust Complete"
     }
+
+    DebugLog("CompletedEvent=" . selectedEvent, "Sim")
 
     ; Mark script action end time and clear flag after action completes
     ; This allows input detection to distinguish between script actions and human input
@@ -1759,31 +2188,29 @@ UpdateSettingsWindowTargetPosition() {
 
     ; Update General Settings window if open
     if (globalSettingsGuiControls != 0) {
-        try {
-            controls := globalSettingsGuiControls
-            if (mouseClickTargetPos != 0 && mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y")) {
-                ; Update to show position
-                controls.clickTargetText.Text := "Position: (" . mouseClickTargetPos.x . ", " . mouseClickTargetPos.y . ")"
-                controls.clickTargetText.SetFont("cBlack")
-                controls.clearTargetBtn.Enabled := true
-            } else {
-                ; Update to show no position
-                controls.clickTargetText.Text := "No target position set"
-                controls.clickTargetText.SetFont("cGray")
-                controls.clearTargetBtn.Enabled := false
-            }
-        } catch {
-            ; If update fails, that's okay
+    try {
+        controls := globalSettingsGuiControls
+            if (HasClickTargetPos()) {
+                controls.clickTargetText.Text := GetClickTargetDisplayText()
+            controls.clickTargetText.SetFont("cBlack")
+            controls.clearTargetBtn.Enabled := true
+        } else {
+            ; Update to show no position
+            controls.clickTargetText.Text := "No target position set"
+            controls.clickTargetText.SetFont("cGray")
+            controls.clearTargetBtn.Enabled := false
         }
+    } catch {
+        ; If update fails, that's okay
     }
+}
 
     ; Update Event Settings window if open
     if (globalEventSettingsGuiControls != 0) {
         try {
             controls := globalEventSettingsGuiControls
-            if (mouseClickTargetPos != 0 && mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y")) {
-                ; Update to show position
-                controls.clickTargetText.Text := "Position: (" . mouseClickTargetPos.x . ", " . mouseClickTargetPos.y . ")"
+            if (HasClickTargetPos()) {
+                controls.clickTargetText.Text := GetClickTargetDisplayText()
                 controls.clickTargetText.SetFont("cBlack")
                 controls.clearTargetBtn.Enabled := true
             } else {
@@ -1792,11 +2219,11 @@ UpdateSettingsWindowTargetPosition() {
                 controls.clickTargetText.SetFont("cGray")
                 controls.clearTargetBtn.Enabled := false
             }
-        } catch {
+            } catch {
             ; If update fails, that's okay
-        }
+            }
     }
-}
+        }
 
 ; Function to set target position from GUI button - shows live position picker
 SetTargetPositionFromGUI(clickTargetText, setTargetBtn, clearTargetBtn, settingsGui, *) {
@@ -1867,7 +2294,6 @@ TogglePauseState(trigger := "User") {
     } else {
         currentActivity := "⏳ Idle - Monitoring for inactivity (10s threshold)"
         LogActivity(trigger, "Resumed simulation")
-        EnsureClickSchedulerRunning()
     }
 
     UpdateTrayIcon()
@@ -1931,50 +2357,8 @@ ParseAutoQuitInput(inputValue, &totalMilliseconds, &timeDisplay) {
 }
 
 ShowAutoQuitSettings() {
-    global scheduledQuitTime
-
-    autoQuitGui := Gui("+AlwaysOnTop -Resize", "Auto-Quit Settings")
-    autoQuitGui.SetFont("s10", "Segoe UI")
-
-    autoQuitGui.Add("Text", "x20 y15 w440", "Auto-Quit Settings")
-    autoQuitGui.Add("Text", "x20 y35 w440 cGray", "Schedule the script to quit automatically after a delay.")
-
-    tab := autoQuitGui.Add("Tab3", "x20 y60 w440 h240", ["Schedule", "Status"])
-
-    ; ----------------------------
-    ; Schedule tab
-    ; ----------------------------
-    tab.UseTab(1)
-    autoQuitGui.Add("Text", "x40 y100 w390", "Enter time before auto-quit:")
-    autoQuitGui.Add("Text", "x40 y118 w390 cGray", "Format: HH:MM (e.g., 2:30) or hours only (e.g., 3). Max 24:00.")
-    inputEdit := autoQuitGui.Add("Edit", "x40 y145 w160", "2:30")
-
-    scheduleBtn := autoQuitGui.Add("Button", "x210 y143 w110 h28 Default", "Schedule")
-    cancelBtn2 := autoQuitGui.Add("Button", "x325 y143 w90 h28", "Cancel")
-
-    statusLine := autoQuitGui.Add("Text", "x40 y185 w390 cGray", "")
-
-    ; ----------------------------
-    ; Status tab
-    ; ----------------------------
-    tab.UseTab(2)
-    statusHeader := autoQuitGui.Add("Text", "x40 y110 w390", "Current status:")
-    statusText := autoQuitGui.Add("Text", "x40 y135 w390 cGray", "")
-
-    refreshFn := RefreshAutoQuitStatus.Bind(autoQuitGui, statusLine, statusText)
-    refreshFn()
-    SetTimer(refreshFn, 500)
-    autoQuitGui.OnEvent("Close", (*) => SetTimer(refreshFn, 0))
-
-    tab.UseTab()
-
-    closeBtn := autoQuitGui.Add("Button", "x360 y315 w100 h30", "Close")
-    closeBtn.OnEvent("Click", (*) => (SetTimer(refreshFn, 0), autoQuitGui.Destroy()))
-
-    scheduleBtn.OnEvent("Click", AutoQuitScheduleClick.Bind(autoQuitGui, inputEdit, statusLine, statusText, refreshFn))
-    cancelBtn2.OnEvent("Click", AutoQuitCancelClick.Bind(autoQuitGui, statusLine, statusText, refreshFn))
-
-    autoQuitGui.Show("w480 h360")
+    ; Auto-Quit is now a tab inside General Settings.
+    ShowGeneralSettings("Auto-Quit")
 }
 
 RefreshAutoQuitStatus(ownerGui, statusLineCtrl, statusTextCtrl, *) {
@@ -1982,13 +2366,20 @@ RefreshAutoQuitStatus(ownerGui, statusLineCtrl, statusTextCtrl, *) {
     if (!IsObject(statusLineCtrl) || !IsObject(statusTextCtrl)) {
         return
     }
-    if (scheduledQuitTime == 0) {
-        statusLineCtrl.Text := "Status: Not scheduled"
-        statusTextCtrl.Text := "Auto-quit is not scheduled."
-    } else {
-        remaining := scheduledQuitTime - A_TickCount
-        statusLineCtrl.Text := "Status: Scheduled (" . FormatRemainingTime(remaining) . " remaining)"
-        statusTextCtrl.Text := "Auto-quit is scheduled.`nTime remaining: " . FormatRemainingTime(remaining) . "`n`nPress Cancel to stop it."
+    ; When the owning GUI closes, a timer tick can still fire briefly.
+    ; Guard against "The control is destroyed." errors on shutdown.
+    try {
+        if (scheduledQuitTime == 0) {
+            statusLineCtrl.Text := "Status: Not scheduled"
+            statusTextCtrl.Text := "Auto-quit is not scheduled."
+        } else {
+            remaining := scheduledQuitTime - A_TickCount
+            statusLineCtrl.Text := "Status: Scheduled (" . FormatRemainingTime(remaining) . " remaining)"
+            statusTextCtrl.Text := "Auto-quit is scheduled.`nTime remaining: " . FormatRemainingTime(remaining) . "`n`nPress Cancel to stop it."
+        }
+    } catch {
+        ; Controls already destroyed (window closed) - ignore.
+        return
     }
 }
 
@@ -2053,7 +2444,7 @@ LoadEventSettings() {
     )
 
     ; Use defaults
-    eventEnabled := defaultEvents.Clone()
+        eventEnabled := defaultEvents.Clone()
 }
 
 ; Function to save event settings (no longer saving to INI file, settings are runtime-only)
@@ -2065,8 +2456,11 @@ SaveEventSettings() {
 ; Function to show event settings dialog
 ShowEventSettings() {
     global eventEnabled, mouseClickTargetPos
-    global mouseMovementMaxIntervalSec, scrollAllowUp, scrollAllowDown, mouseClicksMaxPerMinute
+    global scrollAllowUp, scrollAllowDown, mouseClicksMaxPerMinute
+    global clickTargetJitterPx
     global keyPressActions
+    global hardwareAdjustBrightness, hardwareAdjustBrightnessUseFunctionKeys, hardwareAdjustBrightnessUseWmi
+    global hardwareAdjustVolume, hardwareAdjustVolumeUp, hardwareAdjustVolumeDown, hardwareAdjustVolumeAllowMute
     
     ; Create GUI for event settings
     eventGui := Gui("+AlwaysOnTop -Resize", "Event Settings")
@@ -2092,9 +2486,6 @@ ShowEventSettings() {
     indentX := 65
 
     eventCheckboxes["MouseMovement"] := eventGui.Add("Checkbox", "x0 y0 w250", "Mouse Movement")
-    moveLbl := eventGui.Add("Text", "x0 y0 w240 cGray", "Max interval (sec) (min 0.1):")
-    mouseMoveMaxEdit := eventGui.Add("Edit", "x0 y0 w70", mouseMovementMaxIntervalSec)
-    moveHelp := eventGui.Add("Text", "x0 y0 w440 cGray", "Mouse movement happens randomly within ≤ max seconds.")
 
     eventCheckboxes["ScrollWheel"] := eventGui.Add("Checkbox", "x0 y0 w250", "Scroll Wheel")
     scrollUpChk := eventGui.Add("Checkbox", "x0 y0 w120", "Allow Up")
@@ -2108,7 +2499,16 @@ ShowEventSettings() {
     clicksHelp := eventGui.Add("Text", "x0 y0 w440 cGray", "Actual clicks per minute are randomized: 1..max.")
 
     clickTargetLabel1 := eventGui.Add("Text", "x0 y0 w420", "Mouse Click Target Position:")
-    clickTargetLabel2 := eventGui.Add("Text", "x0 y0 w520 cGray", "Clicks will jitter within a 10×10 px box around the target (±5px)")
+    clickTargetLabel2 := eventGui.Add("Text", "x0 y0 w520 cGray", FormatJitterHelpText(clickTargetJitterPx))
+    jitterLbl := eventGui.Add("Text", "x0 y0 w260 cGray", "Jitter (±px) (min 1):")
+    jitterEdit := eventGui.Add("Edit", "x0 y0 w70", clickTargetJitterPx)
+
+    UpdateJitterHelpText := (*) => (
+        val := SafeInt(jitterEdit.Value, clickTargetJitterPx),
+        (val < 1 ? val := 1 : 0),
+        clickTargetLabel2.Text := FormatJitterHelpText(val)
+    )
+    jitterEdit.OnEvent("Change", UpdateJitterHelpText)
     clickTargetText := eventGui.Add("Text", "x0 y0 w300 cGray", "No target position set")
     setTargetBtn := eventGui.Add("Button", "x0 y0 w90 h25", "Set Target")
     clearTargetBtn := eventGui.Add("Button", "x0 y0 w70 h25 Disabled", "Clear")
@@ -2120,17 +2520,7 @@ ShowEventSettings() {
 
         ; Mouse Movement
         eventCheckboxes["MouseMovement"].Move(baseX, y),
-        y += 28,
-        (eventCheckboxes["MouseMovement"].Value == 1)
-            ? (
-                moveLbl.Visible := true, mouseMoveMaxEdit.Visible := true, moveHelp.Visible := true,
-                moveLbl.Move(indentX, y),
-                mouseMoveMaxEdit.Move(indentX + 210, y - 3),
-                y += rowGap,
-                moveHelp.Move(indentX, y),
-                y += gapBlock + 18
-            )
-            : (moveLbl.Visible := false, mouseMoveMaxEdit.Visible := false, moveHelp.Visible := false, y += gapBlock),
+        y += gapBlock + 18,
 
         ; Scroll Wheel
         eventCheckboxes["ScrollWheel"].Move(baseX, y),
@@ -2163,8 +2553,12 @@ ShowEventSettings() {
                 y += 18,
                 clickTargetLabel2.Move(indentX, y),
                 y += 22,
-                (mouseClickTargetPos != 0 && mouseClickTargetPos.HasProp("x") && mouseClickTargetPos.HasProp("y"))
-                    ? (clickTargetText.Text := "Position: (" . mouseClickTargetPos.x . ", " . mouseClickTargetPos.y . ")", clickTargetText.SetFont("cBlack"), clearTargetBtn.Enabled := true)
+                jitterLbl.Visible := true, jitterEdit.Visible := true,
+                jitterLbl.Move(indentX, y),
+                jitterEdit.Move(indentX + 210, y - 3),
+                y += 22,
+                HasClickTargetPos()
+                    ? (clickTargetText.Text := GetClickTargetDisplayText(), clickTargetText.SetFont("cBlack"), clearTargetBtn.Enabled := true)
                     : (clickTargetText.Text := "No target position set", clickTargetText.SetFont("cGray"), clearTargetBtn.Enabled := false),
                 ; Keep buttons inside the tab: place them under the position line (prevents right-edge clipping)
                 clickTargetText.Move(indentX, y),
@@ -2174,6 +2568,7 @@ ShowEventSettings() {
             : (
                 clicksLbl.Visible := false, clicksPerMinEdit.Visible := false, clicksHelp.Visible := false,
                 clickTargetLabel1.Visible := false, clickTargetLabel2.Visible := false,
+                jitterLbl.Visible := false, jitterEdit.Visible := false,
                 clickTargetText.Visible := false, setTargetBtn.Visible := false, clearTargetBtn.Visible := false
             )
     )
@@ -2188,38 +2583,32 @@ ShowEventSettings() {
     tab.UseTab(2)
     kbBaseX := 40
     kbIndentX := 65
-    kbY := 100
 
-    eventCheckboxes["KeyPresses"] := eventGui.Add("Checkbox", "x" . kbBaseX . " y" . kbY . " w250", "Key Presses")
-    kbY += 30
+    ; Use accordion layout (hide + MOVE controls up) to avoid empty gaps when Key Presses is unticked.
+    eventCheckboxes["KeyPresses"] := eventGui.Add("Checkbox", "x0 y0 w250", "Key Presses")
 
     keyActionCheckboxes := Map()
-    keyActionCheckboxes["Shift"] := eventGui.Add("Checkbox", "x" . kbIndentX . " y" . kbY . " w90", "Shift")
-    keyActionCheckboxes["Ctrl"] := eventGui.Add("Checkbox", "x" . (kbIndentX + 95) . " y" . kbY . " w80", "Ctrl")
-    keyActionCheckboxes["Alt"] := eventGui.Add("Checkbox", "x" . (kbIndentX + 175) . " y" . kbY . " w80", "Alt")
-    keyActionCheckboxes["Tab"] := eventGui.Add("Checkbox", "x" . (kbIndentX + 255) . " y" . kbY . " w80", "Tab")
-    keyActionCheckboxes["Esc"] := eventGui.Add("Checkbox", "x" . (kbIndentX + 335) . " y" . kbY . " w80", "Esc")
-
-    kbY += 26
+    keyActionCheckboxes["Shift"] := eventGui.Add("Checkbox", "x0 y0 w90", "Shift")
+    keyActionCheckboxes["Ctrl"] := eventGui.Add("Checkbox", "x0 y0 w80", "Ctrl")
+    keyActionCheckboxes["Alt"] := eventGui.Add("Checkbox", "x0 y0 w80", "Alt")
+    keyActionCheckboxes["Tab"] := eventGui.Add("Checkbox", "x0 y0 w80", "Tab")
+    keyActionCheckboxes["Esc"] := eventGui.Add("Checkbox", "x0 y0 w80", "Esc")
     ; Alt+Tab is handled by the separate "Window Switch" event to avoid duplication/confusion.
-    keyActionCheckboxes["ScrollLock"] := eventGui.Add("Checkbox", "x" . kbIndentX . " y" . kbY . " w140", "Scroll Lock")
+    keyActionCheckboxes["ScrollLock"] := eventGui.Add("Checkbox", "x0 y0 w140", "Scroll Lock")
+    keyActionCheckboxes["CapsLock"] := eventGui.Add("Checkbox", "x0 y0 w160", "Caps Lock (2x)")
+    keyActionCheckboxes["NumLock"] := eventGui.Add("Checkbox", "x0 y0 w160", "Num Lock (2x)")
 
-    kbY += 22
-    kbHelp := eventGui.Add("Text", "x" . kbIndentX . " y" . kbY . " w430 cGray",
-        "Select which key actions may be used. Tab/Esc/Ctrl+Tab can affect focused apps. Use Window Switch for Alt+Tab.")
+    kbHelp := eventGui.Add("Text", "x0 y0 w430 cGray",
+        "Select which key actions may be used. Tab/Esc can affect focused apps. Use Window Switch for Alt+Tab.")
 
     ; Window switching (Alt+Tab) belongs under Keyboard
-    kbY += 35
-    eventCheckboxes["WindowSwitch"] := eventGui.Add("Checkbox", "x" . kbBaseX . " y" . kbY . " w320", "Window Switch (Alt+Tab)")
-    kbY += 22
-    winSwitchHelp := eventGui.Add("Text", "x" . kbIndentX . " y" . kbY . " w430 cGray",
+    eventCheckboxes["WindowSwitch"] := eventGui.Add("Checkbox", "x0 y0 w320", "Window Switch (Alt+Tab)")
+    winSwitchHelp := eventGui.Add("Text", "x0 y0 w430 cGray",
         "Performs Alt+Tab window switching (separate from Key Presses).")
     
     ; Tab switching (Ctrl+Tab) is a separate event (not a Key Presses sub-option)
-    kbY += 26
-    eventCheckboxes["TabSwitch"] := eventGui.Add("Checkbox", "x" . kbBaseX . " y" . kbY . " w320", "Tab Switch (Ctrl+Tab)")
-    kbY += 22
-    tabSwitchHelp := eventGui.Add("Text", "x" . kbIndentX . " y" . kbY . " w430 cGray",
+    eventCheckboxes["TabSwitch"] := eventGui.Add("Checkbox", "x0 y0 w320", "Tab Switch (Ctrl+Tab)")
+    tabSwitchHelp := eventGui.Add("Text", "x0 y0 w430 cGray",
         "Performs Ctrl+Tab tab switching (separate from Key Presses).")
 
     ; Initialize from current settings
@@ -2229,23 +2618,128 @@ ShowEventSettings() {
         }
     }
 
-    ApplyKeyboardKeyOptionsVisibility := (*) => (
+    ApplyKeyboardTabAccordionLayout := (*) => (
+        y := 95,
+        gapBlock := 12,
+
+        ; Key Presses header
+        eventCheckboxes["KeyPresses"].Move(kbBaseX, y),
+        y += 30,
+
         show := (eventCheckboxes["KeyPresses"].Value == 1),
-        (keyActionCheckboxes["Shift"].Visible := show),
-        (keyActionCheckboxes["Ctrl"].Visible := show),
-        (keyActionCheckboxes["Alt"].Visible := show),
-        (keyActionCheckboxes["Tab"].Visible := show),
-        (keyActionCheckboxes["Esc"].Visible := show),
-        (keyActionCheckboxes["ScrollLock"].Visible := show),
-        (kbHelp.Visible := show)
+        show
+            ? (
+                ; Row 1: Shift/Ctrl/Alt/Tab/Esc
+                keyActionCheckboxes["Shift"].Visible := true,
+                keyActionCheckboxes["Ctrl"].Visible := true,
+                keyActionCheckboxes["Alt"].Visible := true,
+                keyActionCheckboxes["Tab"].Visible := true,
+                keyActionCheckboxes["Esc"].Visible := true,
+                keyActionCheckboxes["Shift"].Move(kbIndentX, y),
+                keyActionCheckboxes["Ctrl"].Move(kbIndentX + 95, y),
+                keyActionCheckboxes["Alt"].Move(kbIndentX + 175, y),
+                keyActionCheckboxes["Tab"].Move(kbIndentX + 255, y),
+                keyActionCheckboxes["Esc"].Move(kbIndentX + 335, y),
+                y += 26,
+
+                ; Row 2: Lock keys
+                keyActionCheckboxes["ScrollLock"].Visible := true,
+                keyActionCheckboxes["CapsLock"].Visible := true,
+                keyActionCheckboxes["NumLock"].Visible := true,
+                keyActionCheckboxes["ScrollLock"].Move(kbIndentX, y),
+                keyActionCheckboxes["CapsLock"].Move(kbIndentX + 145, y),
+                keyActionCheckboxes["NumLock"].Move(kbIndentX + 290, y),
+                y += 22,
+
+                kbHelp.Visible := true,
+                kbHelp.Move(kbIndentX, y),
+                y += 42
+            )
+            : (
+                keyActionCheckboxes["Shift"].Visible := false,
+                keyActionCheckboxes["Ctrl"].Visible := false,
+                keyActionCheckboxes["Alt"].Visible := false,
+                keyActionCheckboxes["Tab"].Visible := false,
+                keyActionCheckboxes["Esc"].Visible := false,
+                keyActionCheckboxes["ScrollLock"].Visible := false,
+                keyActionCheckboxes["CapsLock"].Visible := false,
+                keyActionCheckboxes["NumLock"].Visible := false,
+                kbHelp.Visible := false,
+                y += gapBlock
+            ),
+
+        ; Window Switch (always shown, but moved up/down based on y)
+        eventCheckboxes["WindowSwitch"].Move(kbBaseX, y),
+        y += 22,
+        winSwitchHelp.Move(kbIndentX, y),
+        y += 30,
+
+        ; Tab Switch (always shown, but moved up/down based on y)
+        eventCheckboxes["TabSwitch"].Move(kbBaseX, y),
+        y += 22,
+        tabSwitchHelp.Move(kbIndentX, y)
     )
-    eventCheckboxes["KeyPresses"].OnEvent("Click", ApplyKeyboardKeyOptionsVisibility)
+    eventCheckboxes["KeyPresses"].OnEvent("Click", ApplyKeyboardTabAccordionLayout)
     
     ; ----------------------------
     ; Other tab
     ; ----------------------------
     tab.UseTab(3)
-    eventCheckboxes["HardwareAdjust"] := eventGui.Add("Checkbox", "x40 y125 w320", "Hardware Adjust")
+    otherBaseX := 40
+    otherIndentX := 65
+    otherIndent2X := 85
+    otherY := 110
+
+    eventCheckboxes["HardwareAdjust"] := eventGui.Add("Checkbox", "x" . otherBaseX . " y" . otherY . " w320", "Hardware Adjust")
+    otherY += 24
+
+    ; Keep this description single-line (avoid overlap/wrap issues on DPI/font scaling)
+    hwKeysInfo := eventGui.Add("Text", "x" . otherIndentX . " y" . otherY . " w490 h34 cGray",
+        "Uses brightness keys or Windows WMI; volume keys (Up/Down/Mute).")
+    otherY += 38
+
+    hwBrightnessChk := eventGui.Add("Checkbox", "x" . otherIndentX . " y" . otherY . " w260", "Adjust Brightness")
+    otherY += 22
+    hwBrightnessKeysChk := eventGui.Add("Checkbox", "x" . otherIndent2X . " y" . otherY . " w300", "Use hardware keys (Brightness Up/Down)")
+    otherY += 22
+    hwBrightnessWmiChk := eventGui.Add("Checkbox", "x" . otherIndent2X . " y" . otherY . " w320", "Use Windows API (PowerShell/WMI)")
+    otherY += 28
+
+    hwVolumeChk := eventGui.Add("Checkbox", "x" . otherIndentX . " y" . otherY . " w260", "Adjust Volume")
+    otherY += 22
+    hwVolumeUpChk := eventGui.Add("Checkbox", "x" . otherIndent2X . " y" . otherY . " w110", "Volume +")
+    hwVolumeDownChk := eventGui.Add("Checkbox", "x" . (otherIndent2X + 115) . " y" . otherY . " w110", "Volume -")
+    otherY += 22
+    hwVolumeMuteChk := eventGui.Add("Checkbox", "x" . otherIndent2X . " y" . otherY . " w240", "Allow mute toggle")
+
+    ; Initialize from current settings
+    hwBrightnessChk.Value := hardwareAdjustBrightness ? 1 : 0
+    hwBrightnessKeysChk.Value := hardwareAdjustBrightnessUseFunctionKeys ? 1 : 0
+    hwBrightnessWmiChk.Value := hardwareAdjustBrightnessUseWmi ? 1 : 0
+    hwVolumeChk.Value := hardwareAdjustVolume ? 1 : 0
+    hwVolumeUpChk.Value := hardwareAdjustVolumeUp ? 1 : 0
+    hwVolumeDownChk.Value := hardwareAdjustVolumeDown ? 1 : 0
+    hwVolumeMuteChk.Value := hardwareAdjustVolumeAllowMute ? 1 : 0
+
+    ApplyHardwareAdjustVisibility := (*) => (
+        show := (eventCheckboxes["HardwareAdjust"].Value == 1),
+        (hwKeysInfo.Visible := show),
+        (hwBrightnessChk.Visible := show),
+        (hwVolumeChk.Visible := show),
+
+        brightOn := (show && hwBrightnessChk.Value == 1),
+        (hwBrightnessKeysChk.Visible := brightOn),
+        (hwBrightnessWmiChk.Visible := brightOn),
+
+        volOn := (show && hwVolumeChk.Value == 1),
+        (hwVolumeUpChk.Visible := volOn),
+        (hwVolumeDownChk.Visible := volOn),
+        (hwVolumeMuteChk.Visible := volOn)
+    )
+
+    eventCheckboxes["HardwareAdjust"].OnEvent("Click", ApplyHardwareAdjustVisibility)
+    hwBrightnessChk.OnEvent("Click", ApplyHardwareAdjustVisibility)
+    hwVolumeChk.OnEvent("Click", ApplyHardwareAdjustVisibility)
     
     ; End tabbed section
     tab.UseTab()
@@ -2255,7 +2749,8 @@ ShowEventSettings() {
         checkbox.Value := eventEnabled[eventName] ? 1 : 0
     }
     ApplyMouseTabAccordionLayout()
-    ApplyKeyboardKeyOptionsVisibility()
+    ApplyKeyboardTabAccordionLayout()
+    ApplyHardwareAdjustVisibility()
 
     ; Info text
     noteText := eventGui.Add("Text", "x20 y500 w520 cGray",
@@ -2275,7 +2770,16 @@ ShowEventSettings() {
     ))
 
     ; Button handlers
-    saveBtn.OnEvent("Click", SaveEventSettingsHandler.Bind(eventCheckboxes, mouseMoveMaxEdit, scrollUpChk, scrollDownChk, clicksPerMinEdit, keyActionCheckboxes, eventGui))
+    hardwareCtrls := {
+        hwBrightnessChk: hwBrightnessChk,
+        hwBrightnessKeysChk: hwBrightnessKeysChk,
+        hwBrightnessWmiChk: hwBrightnessWmiChk,
+        hwVolumeChk: hwVolumeChk,
+        hwVolumeUpChk: hwVolumeUpChk,
+        hwVolumeDownChk: hwVolumeDownChk,
+        hwVolumeMuteChk: hwVolumeMuteChk
+    }
+    saveBtn.OnEvent("Click", SaveEventSettingsHandler.Bind(eventCheckboxes, scrollUpChk, scrollDownChk, clicksPerMinEdit, jitterEdit, clickTargetLabel2, keyActionCheckboxes, hardwareCtrls, eventGui))
     cancelBtn.OnEvent("Click", (*) => (globalEventSettingsGuiControls := 0, eventGui.Destroy()))
     setTargetBtn.OnEvent("Click", SetTargetPositionFromGUI.Bind(clickTargetText, setTargetBtn, clearTargetBtn,
         eventGui))
@@ -2287,28 +2791,28 @@ ShowEventSettings() {
 }
 
 ; Function to save event settings
-SaveEventSettingsHandler(eventCheckboxes, mouseMoveMaxEdit, scrollUpChk, scrollDownChk, clicksPerMinEdit, keyActionCheckboxes, eventGui, *) {
-    global eventEnabled, mouseMovementMaxIntervalSec, scrollAllowUp, scrollAllowDown, mouseClicksMaxPerMinute
+SaveEventSettingsHandler(eventCheckboxes, scrollUpChk, scrollDownChk, clicksPerMinEdit, jitterEdit, jitterHelpLabel, keyActionCheckboxes, hardwareCtrls, eventGui, *) {
+    global eventEnabled, scrollAllowUp, scrollAllowDown, mouseClicksMaxPerMinute
+    global simulationActive, pausedByUser
+    global clickTargetJitterPx
     global keyPressActions
+    global hardwareAdjustBrightness, hardwareAdjustBrightnessUseFunctionKeys, hardwareAdjustBrightnessUseWmi
+    global hardwareAdjustVolume, hardwareAdjustVolumeUp, hardwareAdjustVolumeDown, hardwareAdjustVolumeAllowMute
     
     ; Save event states from checkboxes
     for eventName, checkbox in eventCheckboxes {
         eventEnabled[eventName] := (checkbox.Value == 1)
     }
 
-    ; Validate + save mouse movement max interval
-    if (eventEnabled["MouseMovement"]) {
-        try {
-            v := Float(mouseMoveMaxEdit.Value)
-            if (v < 0.1) {
-                ShowOwnedPopup(eventGui.Hwnd, "Mouse Movement max interval must be at least 0.1 seconds.", "Invalid Value")
-                return
-            }
-            mouseMovementMaxIntervalSec := v
-        } catch {
-            ShowOwnedPopup(eventGui.Hwnd, "Mouse Movement max interval must be a number (e.g., 2.5).", "Invalid Value")
-            return
-        }
+    ; If MouseClicks was disabled, stop any running click scheduler immediately.
+    if (!eventEnabled["MouseClicks"]) {
+        StopClickScheduler()
+    }
+    ; Note: Target click scheduler now runs ONLY when the random picker chooses MouseClicks (click session).
+
+    ; Kick a near-immediate next cycle so the *next* random activity reflects new toggles.
+    if (simulationActive && !pausedByUser) {
+        SetTimer(SimulateHuman, -200)
     }
 
     ; Save scroll direction toggles
@@ -2334,6 +2838,25 @@ SaveEventSettingsHandler(eventCheckboxes, mouseMoveMaxEdit, scrollUpChk, scrollD
         }
     }
 
+    ; Validate + save target jitter (±px)
+    try {
+        j := Integer(jitterEdit.Value)
+        if (j < 1) {
+            ShowOwnedPopup(eventGui.Hwnd, "Target jitter must be at least 1px.", "Invalid Value")
+            return
+        }
+        maxJ := Max(1, GetMaxTargetJitterPx())
+        if (j > maxJ) {
+            j := maxJ
+            jitterEdit.Value := j
+        }
+        clickTargetJitterPx := j
+        try jitterHelpLabel.Text := FormatJitterHelpText(clickTargetJitterPx)
+    } catch {
+        ShowOwnedPopup(eventGui.Hwnd, "Target jitter must be an integer number of pixels.", "Invalid Value")
+        return
+    }
+
     ; Save key action toggles (only validate when KeyPresses is enabled)
     if (eventEnabled["KeyPresses"] && IsObject(keyActionCheckboxes)) {
         anyOn := false
@@ -2349,9 +2872,36 @@ SaveEventSettingsHandler(eventCheckboxes, mouseMoveMaxEdit, scrollUpChk, scrollD
             return
         }
     }
+
+    ; Save hardware adjust sub-options
+    if (IsObject(hardwareCtrls)) {
+        hardwareAdjustBrightness := (hardwareCtrls.hwBrightnessChk.Value == 1)
+        hardwareAdjustBrightnessUseFunctionKeys := (hardwareCtrls.hwBrightnessKeysChk.Value == 1)
+        hardwareAdjustBrightnessUseWmi := (hardwareCtrls.hwBrightnessWmiChk.Value == 1)
+        hardwareAdjustVolume := (hardwareCtrls.hwVolumeChk.Value == 1)
+        hardwareAdjustVolumeUp := (hardwareCtrls.hwVolumeUpChk.Value == 1)
+        hardwareAdjustVolumeDown := (hardwareCtrls.hwVolumeDownChk.Value == 1)
+        hardwareAdjustVolumeAllowMute := (hardwareCtrls.hwVolumeMuteChk.Value == 1)
+    }
+
+    ; Validate hardware adjust config when enabled
+    if (eventEnabled["HardwareAdjust"]) {
+        if (!hardwareAdjustBrightness && !hardwareAdjustVolume) {
+            ShowOwnedPopup(eventGui.Hwnd, "Hardware Adjust is enabled, but both Brightness and Volume are disabled.`n`nEnable at least one sub-option or untick Hardware Adjust.", "Nothing to Adjust")
+            return
+        }
+        if (hardwareAdjustBrightness && !hardwareAdjustBrightnessUseFunctionKeys && !hardwareAdjustBrightnessUseWmi) {
+            ShowOwnedPopup(eventGui.Hwnd, "Brightness adjust is enabled, but both methods are disabled.`n`nEnable hardware keys and/or Windows API (WMI).", "No Brightness Method")
+            return
+        }
+        if (hardwareAdjustVolume && !hardwareAdjustVolumeUp && !hardwareAdjustVolumeDown && !hardwareAdjustVolumeAllowMute) {
+            ShowOwnedPopup(eventGui.Hwnd, "Volume adjust is enabled, but Volume +, Volume -, and mute are all disabled.`n`nEnable at least one option.", "No Volume Options")
+            return
+        }
+    }
     
     ; Log changes
-    LogActivity("Event Settings", "Updated mouse settings (move max=" . mouseMovementMaxIntervalSec . "s, clicks max=" . mouseClicksMaxPerMinute . "/min)")
+    LogActivity("Event Settings", "Updated mouse settings (clicks max=" . mouseClicksMaxPerMinute . "/min, jitter=±" . clickTargetJitterPx . "px)")
 
     ; Keep window open on Save (apply immediately)
     ShowOwnedPopup(eventGui.Hwnd, "Event settings saved. Changes are active now.", "Saved")
@@ -2363,8 +2913,10 @@ SaveEventSettingsHandler(eventCheckboxes, mouseMoveMaxEdit, scrollUpChk, scrollD
 }
 
 ; Function to show general settings dialog
-ShowGeneralSettings() {
+; initialTab can be: "Timing", "Auto-Quit", "Service Pause", "Info"
+ShowGeneralSettings(initialTab := "Timing") {
     global inactivityThreshold, inactivityJitter, actionBufferTime, mouseClickTargetPos
+    global pauseServices, serviceCheckEnabled
 
     ; Store original default values from global variables (these are the script defaults)
     ; These values come from the GLOBAL VARIABLES section at the top of the script
@@ -2383,10 +2935,10 @@ ShowGeneralSettings() {
     defaultBufferSec := Round(defaultActionBufferTime / 1000)
 
     ; Header
-    settingsGui.Add("Text", "x20 y15 w440", "General Settings")
-    settingsGui.Add("Text", "x20 y35 w440 cGray", "Adjust timings used to detect inactivity and avoid patterns.")
+    settingsGui.Add("Text", "x20 y15 w540", "General Settings")
+    settingsGui.Add("Text", "x20 y35 w540 cGray", "Adjust timings, auto-quit, and service pause behavior.")
 
-    tab := settingsGui.Add("Tab3", "x20 y60 w440 h260", ["Timing", "Info"])
+    tab := settingsGui.Add("Tab3", "x20 y60 w520 h360", ["Timing", "Auto-Quit", "Service Pause", "Info"])
 
     ; ----------------------------
     ; Timing tab
@@ -2423,21 +2975,87 @@ ShowGeneralSettings() {
     ; ----------------------------
     ; Info tab
     ; ----------------------------
+    tab.UseTab(4)
+    infoY := 100
+    settingsGui.Add("Text", "x40 y" . infoY . " w480", "Timing tab")
+    infoY += 18
+    settingsGui.Add("Text", "x40 y" . infoY . " w480 cGray",
+        "Controls inactivity detection and pacing: threshold, jitter, and action buffer time.")
+
+    infoY += 34
+    settingsGui.Add("Text", "x40 y" . infoY . " w480", "Auto-Quit tab")
+    infoY += 18
+    settingsGui.Add("Text", "x40 y" . infoY . " w480 cGray",
+        "Schedules the script to exit after a delay. Status updates live while this window is open.")
+
+    infoY += 34
+    settingsGui.Add("Text", "x40 y" . infoY . " w480", "Service Pause tab")
+    infoY += 18
+    settingsGui.Add("Text", "x40 y" . infoY . " w480 cGray",
+        "Pauses simulation automatically when any listed processes/services are detected running.")
+
+    infoY += 34
+    settingsGui.Add("Text", "x40 y" . infoY . " w480", "Related settings / shortcuts")
+    infoY += 18
+    settingsGui.Add("Text", "x40 y" . infoY . " w480 cGray", "- Event Settings (Ctrl+Alt+Shift+T): event toggles + mouse target position")
+    infoY += 18
+    settingsGui.Add("Text", "x40 y" . infoY . " w480 cGray", "- General Settings (Ctrl+Alt+Shift+S): this window (Timing / Auto-Quit / Service Pause)")
+    infoY += 18
+    settingsGui.Add("Text", "x40 y" . infoY . " w480 cGray", "Note: Changes apply immediately (runtime-only; no INI file).")
+
+    ; ----------------------------
+    ; Auto-Quit tab
+    ; ----------------------------
     tab.UseTab(2)
-    settingsGui.Add("Text", "x40 y110 w390", "Related settings are in the tray menu:")
-    settingsGui.Add("Text", "x40 y130 w390 cGray", "- Event Settings (mouse/keyboard toggles)")
-    settingsGui.Add("Text", "x40 y148 w390 cGray", "- Mouse Click Target Position (inside Event Settings → Mouse tab)")
-    settingsGui.Add("Text", "x40 y175 w390 cGray", "Note: Changes take effect immediately.")
+    settingsGui.Add("Text", "x40 y100 w480", "Schedule the script to quit automatically after a delay.")
+    settingsGui.Add("Text", "x40 y120 w480 cGray", "Format: HH:MM (e.g., 2:30) or hours only (e.g., 3). Max 24:00.")
+    autoQuitInputEdit := settingsGui.Add("Edit", "x40 y148 w160", "2:30")
+    autoQuitScheduleBtn := settingsGui.Add("Button", "x210 y146 w110 h28 Default", "Schedule")
+    autoQuitCancelBtn := settingsGui.Add("Button", "x325 y146 w90 h28", "Cancel")
+    autoQuitStatusLine := settingsGui.Add("Text", "x40 y190 w480 cGray", "")
+    autoQuitStatusText := settingsGui.Add("Text", "x40 y215 w480 h90 cGray", "")
+
+    refreshFn := RefreshAutoQuitStatus.Bind(settingsGui, autoQuitStatusLine, autoQuitStatusText)
+    refreshFn()
+    SetTimer(refreshFn, 500)
+    settingsGui.OnEvent("Close", (*) => SetTimer(refreshFn, 0))
+    autoQuitScheduleBtn.OnEvent("Click", AutoQuitScheduleClick.Bind(settingsGui, autoQuitInputEdit, autoQuitStatusLine, autoQuitStatusText, refreshFn))
+    autoQuitCancelBtn.OnEvent("Click", AutoQuitCancelClick.Bind(settingsGui, autoQuitStatusLine, autoQuitStatusText, refreshFn))
+
+    ; ----------------------------
+    ; Service Pause tab
+    ; ----------------------------
+    tab.UseTab(3)
+    serviceEnableCheckbox := settingsGui.Add("Checkbox", "x40 y100 w480", "Enable service checking")
+    serviceEnableCheckbox.Value := serviceCheckEnabled ? 1 : 0
+
+    settingsGui.Add("Text", "x40 y130 w480", "Service/Process names (one per line):")
+    settingsGui.Add("Text", "x40 y148 w480 cGray", "Examples: chrome.exe, notepad.exe")
+    serviceListEdit := settingsGui.Add("Edit", "x40 y170 w460 h140 Multi VScroll", "")
+
+    placeholderText := "chrome.exe`r`nnotepad.exe`r`nhello.txt`r`nworldmap.exe`r`nd2x.dll"
+    if (pauseServices.Length > 0) {
+        serviceListText := ""
+        for serviceName in pauseServices {
+            serviceListText .= serviceName . "`r`n"
+        }
+        serviceListEdit.Value := Trim(serviceListText, "`r`n")
+    } else {
+        serviceListEdit.Value := placeholderText
+    }
+    serviceListEdit.OnEvent("Focus", ClearPlaceholder.Bind(serviceListEdit, placeholderText))
+    serviceClearBtn := settingsGui.Add("Button", "x40 y320 w100 h28", "Clear All")
+    serviceClearBtn.OnEvent("Click", ClearServiceList.Bind(serviceListEdit))
 
     tab.UseTab()
 
     ; Buttons (Cancel acts as close button)
-    resetBtn := settingsGui.Add("Button", "x20 y300 w100 h30", "Reset")
-    saveBtn := settingsGui.Add("Button", "x260 y300 w100 h30 Default", "Save")
-    cancelBtn := settingsGui.Add("Button", "x360 y300 w100 h30", "Close")
+    resetBtn := settingsGui.Add("Button", "x20 y440 w100 h30", "Reset")
+    saveBtn := settingsGui.Add("Button", "x360 y440 w100 h30 Default", "Save")
+    cancelBtn := settingsGui.Add("Button", "x460 y440 w100 h30", "Close")
 
     ; Button handlers using closures
-    saveBtn.OnEvent("Click", SaveSettingsHandler.Bind(thresholdEdit, jitterEdit, bufferEdit, settingsGui))
+    saveBtn.OnEvent("Click", SaveSettingsHandler.Bind(thresholdEdit, jitterEdit, bufferEdit, settingsGui, serviceListEdit, serviceEnableCheckbox))
     cancelBtn.OnEvent("Click", (*) => settingsGui.Destroy())
     resetBtn.OnEvent("Click", ResetSettingsHandler.Bind(thresholdEdit, jitterEdit, bufferEdit, defaultThresholdSec,
         defaultJitterSec, defaultBufferSec))
@@ -2446,7 +3064,14 @@ ShowGeneralSettings() {
     settingsGui.OnEvent("Size", GeneralSettings_OnResize.Bind(tab, resetBtn, saveBtn, cancelBtn))
 
     ; Show window
-    settingsGui.Show("w480 h400")
+    ; Select initial tab
+    try {
+        tabMap := Map("Timing", 1, "Auto-Quit", 2, "Service Pause", 3, "Info", 4)
+        if (tabMap.Has(initialTab)) {
+            tab.Value := tabMap[initialTab]
+        }
+    }
+    settingsGui.Show("w600 h520")
 }
 
 GeneralSettings_OnResize(tabCtrl, resetBtn, saveBtn, cancelBtn, guiObj, minMax, width, height) {
@@ -2522,7 +3147,7 @@ ShowAlwaysOnTopMessage(message, title) {
 }
 
 ; Function to save settings
-SaveSettingsHandler(thresholdEdit, jitterEdit, bufferEdit, settingsGui, *) {
+SaveSettingsHandler(thresholdEdit, jitterEdit, bufferEdit, settingsGui, serviceListEdit := 0, enableCheckbox := 0, *) {
     global inactivityThreshold, inactivityJitter, actionBufferTime
 
     ; Validate and save settings
@@ -2554,6 +3179,11 @@ SaveSettingsHandler(thresholdEdit, jitterEdit, bufferEdit, settingsGui, *) {
     actionBufferTime := bufferValue * 1000
 
     ; Settings are runtime-only (no longer saved to INI file)
+
+    ; Save service pause settings too (if controls were provided)
+    if (IsObject(serviceListEdit) && IsObject(enableCheckbox)) {
+        SaveServiceSettings(serviceListEdit, enableCheckbox, settingsGui)
+    }
 
     msgBoxText := "Settings saved successfully!`n`n" .
         "Inactivity Threshold: " . thresholdValue . " seconds`n" .
@@ -2757,70 +3387,8 @@ ResizeServiceSettings(serviceListEdit, guiObj, minMax, width, height) {
 ; ============================================
 ; Function to show service pause settings dialog
 ShowServiceSettings() {
-    global pauseServices, serviceCheckEnabled
-
-    ; Create GUI for service settings (match Event Settings style)
-    serviceGui := Gui("+AlwaysOnTop -Resize", "Service Pause Settings")
-    serviceGui.SetFont("s10", "Segoe UI")
-
-    ; Header
-    serviceGui.Add("Text", "x20 y15 w440", "Service Pause Settings")
-    serviceGui.Add("Text", "x20 y35 w440 cGray", "Pause simulation when any listed processes/services are running.")
-
-    tab := serviceGui.Add("Tab3", "x20 y60 w440 h250", ["Services", "Info"])
-
-    ; ----------------------------
-    ; Services tab
-    ; ----------------------------
-    tab.UseTab(1)
-    enableCheckbox := serviceGui.Add("Checkbox", "x40 y100 w360", "Enable service checking")
-    enableCheckbox.Value := serviceCheckEnabled ? 1 : 0
-
-    serviceGui.Add("Text", "x40 y130 w380", "Service/Process names (one per line):")
-    serviceGui.Add("Text", "x40 y148 w380 cGray", "Examples: chrome.exe, notepad.exe")
-    serviceListEdit := serviceGui.Add("Edit", "x40 y170 w380 h110 Multi VScroll", "")
-
-    ; Placeholder text constant
-    placeholderText := "chrome.exe`r`nnotepad.exe`r`nhello.txt`r`nworldmap.exe`r`nd2x.dll"
-
-    ; Populate with current services or show placeholder
-    if (pauseServices.Length > 0) {
-        serviceListText := ""
-        for serviceName in pauseServices {
-            serviceListText .= serviceName . "`r`n"
-        }
-        serviceListEdit.Value := Trim(serviceListText, "`r`n")
-    } else {
-        ; Show placeholder text (will be cleared when user starts typing)
-        serviceListEdit.Value := placeholderText
-    }
-
-    ; Clear placeholder when user focuses on edit box
-    serviceListEdit.OnEvent("Focus", ClearPlaceholder.Bind(serviceListEdit, placeholderText))
-
-    ; ----------------------------
-    ; Info tab
-    ; ----------------------------
-    tab.UseTab(2)
-    serviceGui.Add("Text", "x40 y110 w390", "How it works:")
-    serviceGui.Add("Text", "x40 y130 w390 cGray", "- When enabled, the script periodically checks for these names.")
-    serviceGui.Add("Text", "x40 y148 w390 cGray", "- If any are running, simulation pauses automatically.")
-    serviceGui.Add("Text", "x40 y175 w390 cGray", "Tip: Use exact process names (e.g., chrome.exe).")
-
-    tab.UseTab()
-
-    ; Buttons (positioned with proper spacing, no overlap)
-    clearBtn := serviceGui.Add("Button", "x20 y325 w100 h30", "Clear All")
-    saveBtn := serviceGui.Add("Button", "x260 y325 w100 h30 Default", "Save")
-    cancelBtn := serviceGui.Add("Button", "x360 y325 w100 h30", "Close")
-
-    ; Button handlers
-    clearBtn.OnEvent("Click", ClearServiceList.Bind(serviceListEdit))
-    saveBtn.OnEvent("Click", SaveServiceSettings.Bind(serviceListEdit, enableCheckbox, serviceGui))
-    cancelBtn.OnEvent("Click", (*) => serviceGui.Destroy())
-
-    ; Show GUI
-    serviceGui.Show("w480 h370")
+    ; Service Pause settings are now a tab inside General Settings.
+    ShowGeneralSettings("Service Pause")
 }
 
 ; Function to clear service list
@@ -2913,8 +3481,8 @@ SaveServiceSettings(serviceListEdit, enableCheckbox, serviceGui, *) {
 }
 
 ; Custom hotkey: Ctrl+Alt+Shift+T (unused by browsers, Windows, or editors)
-^!+t:: {  ; Ctrl+Alt+Shift+T: Schedule Auto-Quit
-    ShowAutoQuitSettings()
+^!+t:: {  ; Ctrl+Alt+Shift+T: Open Event Settings
+    ShowEventSettings()
 }
 
 ; Function to check if scheduled quit time has been reached
@@ -3124,15 +3692,14 @@ ShowScriptStatus() {
     statusMsg .= "Simulation: " . (simulationActive ? "Running" : "Waiting for inactivity") . "`n"
     statusMsg .= "Paused: " . (pausedByUser ? "Yes" : "No") . "`n"
     statusMsg .= "`n"
-    statusMsg .= "=== Recent Activity Log ===" . "`n"
+    statusMsg .= "=== Action Log (latest first) ===" . "`n"
 
-    ; Show last 20 activities (most recent first)
+    ; Show up to the last 100 activities (most recent first)
     logCount := activityLog.Length
     if (logCount == 0) {
         statusMsg .= "No activities yet - script monitoring..." . "`n"
     } else {
-        ; Show last 20 entries (reverse order - newest first)
-        startIdx := Max(1, logCount - 19)
+        startIdx := Max(1, logCount - 99)
         loop (logCount - startIdx + 1) {
             idx := logCount - A_Index + 1
             if (idx >= startIdx && idx <= logCount) {
@@ -3159,10 +3726,8 @@ ShowScriptStatus() {
 A_TrayMenu.Delete()  ; Clear default menu
 A_TrayMenu.Add(trayToggleMenuCurrentLabel := "Toggle Simulation", (*) => TogglePauseState("Tray Menu"))
 A_TrayMenu.Add()  ; Separator
-A_TrayMenu.Add("Event Settings", (*) => ShowEventSettings())
+A_TrayMenu.Add("Event Settings (Ctrl+Alt+Shift+T)", (*) => ShowEventSettings())
 A_TrayMenu.Add("General Settings (Ctrl+Alt+Shift+S)", (*) => Send("^!+s"))
-A_TrayMenu.Add("Auto-Quit setting (Ctrl+Alt+Shift+T)", (*) => ShowAutoQuitSettings())
-A_TrayMenu.Add("Service Pause Settings", (*) => ShowServiceSettings())
 A_TrayMenu.Add()  ; Separator
 A_TrayMenu.Add("Exit (Ctrl+Alt+Q)", (*) => ExitApp())
 
